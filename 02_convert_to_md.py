@@ -6,7 +6,7 @@ from tqdm import tqdm
 from bs4 import BeautifulSoup
 import bleach
 import re
-import js2py
+import json
 import logging
 import traceback
 from markdownify import markdownify as md
@@ -14,6 +14,55 @@ from markdownify import markdownify as md
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
+
+def parse_js_define_call(js_content):
+    """
+    Parse JavaScript files that contain define() calls with JSON-like objects.
+    This replaces the js2py functionality for parsing TOC files.
+    """
+    try:
+        # Remove comments and clean up the JavaScript content
+        # Remove single-line comments
+        js_content = re.sub(r'//.*', '', js_content)
+        # Remove multi-line comments
+        js_content = re.sub(r'/\*.*?\*/', '', js_content, flags=re.DOTALL)
+        
+        # Find the define() call and extract the object
+        # Look for define({ ... }) or define( { ... } )
+        define_pattern = r'define\s*\(\s*(\{.*\})\s*\)'
+        match = re.search(define_pattern, js_content, re.DOTALL)
+        
+        if not match:
+            return None
+            
+        obj_str = match.group(1)
+        
+        # Convert JavaScript object notation to JSON
+        # Replace single quotes with double quotes
+        obj_str = re.sub(r"'([^']*)'", r'"\1"', obj_str)
+        
+        # Handle unquoted property names (convert to quoted)
+        obj_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', obj_str)
+        
+        # Handle trailing commas
+        obj_str = re.sub(r',\s*}', '}', obj_str)
+        obj_str = re.sub(r',\s*]', ']', obj_str)
+        
+        # Try to parse as JSON
+        try:
+            return json.loads(obj_str)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try a more aggressive cleanup
+            # Remove any remaining JavaScript-specific syntax
+            obj_str = re.sub(r'undefined', 'null', obj_str)
+            obj_str = re.sub(r'\btrue\b', 'true', obj_str)
+            obj_str = re.sub(r'\bfalse\b', 'false', obj_str)
+            
+            return json.loads(obj_str)
+            
+    except Exception as e:
+        logger.warning(f"Failed to parse JavaScript define call: {e}")
+        return None
 
 def process_base_folder(base_folder, image_extensions, max_workers):
     images = []
@@ -280,15 +329,10 @@ def parse_toc_files(toc_pairs, base_path, md_folder):
                 with open(chunk_full_path, 'r', encoding='utf-8', errors='ignore') as f:
                     js_content_chunk = f.read()
 
-                context_chunk = js2py.EvalJs()
-                context_chunk.execute("""
-                var toc_chunk = {};
-                function define(obj) {
-                    toc_chunk = obj;
-                }
-                """)
-                context_chunk.execute(js_content_chunk)
-                toc_chunk = context_chunk.toc_chunk.to_dict()
+                toc_chunk = parse_js_define_call(js_content_chunk)
+                if toc_chunk is None:
+                    logger.error(f"Could not parse {chunk_full_path}")
+                    continue
             except Exception as e:
                 logger.error(f"Error parsing {chunk_full_path}: {e}\n{traceback.format_exc()}")
                 continue
@@ -305,15 +349,10 @@ def parse_toc_files(toc_pairs, base_path, md_folder):
             with open(hierarchy_full_path, 'r', encoding='utf-8', errors='ignore') as f:
                 js_content_hierarchy = f.read()
 
-            context_hierarchy = js2py.EvalJs()
-            context_hierarchy.execute("""
-            var toc_data = {};
-            function define(obj) {
-                toc_data = obj;
-            }
-            """)
-            context_hierarchy.execute(js_content_hierarchy)
-            toc = context_hierarchy.toc_data.to_dict()
+            toc = parse_js_define_call(js_content_hierarchy)
+            if toc is None:
+                logger.error(f"Could not parse Hierarchy.js ({hierarchy_full_path})")
+                continue
         except Exception as e:
             logger.error(f"Error parsing Hierarchy.js ({hierarchy_full_path}): {e}\n{traceback.format_exc()}")
             continue
@@ -547,14 +586,20 @@ def main():
                         help='List of image file extensions to include.')
     args = parser.parse_args()
 
-    # Get all subfolders (base folders)
-    base_folders = [
-        os.path.join(args.input_folder, name) for name in os.listdir(args.input_folder)
-        if os.path.isdir(os.path.join(args.input_folder, name))
-    ]
+    # Get all subfolders (base folders), excluding output 'md' directories
+    base_folders = []
+    
+    # Always process the input folder itself first
+    base_folders.append(args.input_folder)
+    
+    # Add subdirectories, but exclude 'md' directories to avoid processing output as input
+    for name in os.listdir(args.input_folder):
+        subdir_path = os.path.join(args.input_folder, name)
+        if os.path.isdir(subdir_path) and name != 'md':
+            base_folders.append(subdir_path)
 
     if not base_folders:
-        logger.error(f"No base folders found in {args.input_folder}. Exiting.")
+        logger.error(f"No folders found to process in {args.input_folder}. Exiting.")
         return
 
     # Determine the number of workers for processing base folders
