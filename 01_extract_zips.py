@@ -20,8 +20,8 @@ logging.basicConfig(
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Extract specific folders from ZIP files based on pattern.")
-    parser.add_argument('input', type=str, help='Input directory containing ZIP files.')
-    parser.add_argument('-o', '--output', type=str, default='mfdocs', help='Output directory. Defaults to ./mfdocs')
+    parser.add_argument('inputs', nargs='+', help='One or more ZIP files or directories containing ZIP files.')
+    parser.add_argument('-o', '--output', type=str, default=None, help='Output directory. If omitted, you will be prompted (default: ./mfdocs)')
     return parser.parse_args()
 
 def find_base_paths(zip_path):
@@ -281,22 +281,95 @@ def main():
     # Check if no arguments were provided
     if len(sys.argv) == 1:
         parser = argparse.ArgumentParser(description="Extract specific folders from ZIP files based on pattern.")
-        parser.add_argument('input', type=str, help='Input directory containing ZIP files.')
-        parser.add_argument('-o', '--output', type=str, default='mfdocs', help='Output directory. Defaults to ./mfdocs')
+        parser.add_argument('inputs', nargs='+', help='One or more ZIP files or directories containing ZIP files.')
+        parser.add_argument('-o', '--output', type=str, default=None, help='Output directory. If omitted, you will be prompted (default: ./mfdocs)')
         parser.print_help()
         return
 
     args = parse_arguments()
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
+
+    # Determine output directory (offer prompt if not set)
+    default_output = Path('mfdocs')
+    if args.output is None and sys.stdin.isatty():
+        try:
+            user_out = input(f"Output directory [{default_output}]: ").strip()
+        except EOFError:
+            user_out = ''
+        output_dir = Path(user_out) if user_out else default_output
+    else:
+        output_dir = Path(args.output) if args.output else default_output
 
     # Create output directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all ZIP files in the input directory
-    zip_files = list(input_dir.rglob('*.zip'))
+    # Gather ZIP files from inputs
+    explicit_zip_files = []
+    discovered_zip_files = []
+    for raw in args.inputs:
+        p = Path(raw).expanduser().resolve()
+        if p.is_file() and p.suffix.lower() == '.zip':
+            explicit_zip_files.append(p)
+        elif p.is_dir():
+            discovered_zip_files.extend(sorted(p.rglob('*.zip')))
+        else:
+            logging.warning(f"Input path not found or not a supported type: '{p}'")
+
+    # Deduplicate while preserving order
+    def _dedup(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    explicit_zip_files = _dedup(explicit_zip_files)
+    discovered_zip_files = [z for z in _dedup(discovered_zip_files) if z not in explicit_zip_files]
+
+    # If there are directory-discovered zips and we are interactive, offer selection
+    selected_from_dirs = []
+    if discovered_zip_files and sys.stdin.isatty():
+        print("Found ZIP files in provided directories:")
+        for idx, z in enumerate(discovered_zip_files, start=1):
+            print(f"  {idx}. {z}")
+        print("\nSelect ZIPs to process by number (e.g., 1,3-5). Press Enter for all. Type 0 to skip directory ZIPs.")
+        try:
+            choice = input("Selection: ").strip()
+        except EOFError:
+            choice = ''
+
+        def parse_selection(selection_text, total):
+            if not selection_text:
+                return list(range(1, total + 1))
+            if selection_text == '0':
+                return []
+            indices = set()
+            parts = [p.strip() for p in selection_text.split(',') if p.strip()]
+            for part in parts:
+                if '-' in part:
+                    a, b = part.split('-', 1)
+                    if a.isdigit() and b.isdigit():
+                        start = int(a)
+                        end = int(b)
+                        if start <= end:
+                            for i in range(start, end + 1):
+                                if 1 <= i <= total:
+                                    indices.add(i)
+                elif part.isdigit():
+                    i = int(part)
+                    if 1 <= i <= total:
+                        indices.add(i)
+            return sorted(indices)
+
+        selected_indices = parse_selection(choice, len(discovered_zip_files))
+        selected_from_dirs = [discovered_zip_files[i - 1] for i in selected_indices]
+    else:
+        selected_from_dirs = discovered_zip_files
+
+    zip_files = explicit_zip_files + selected_from_dirs
     if not zip_files:
-        print("No ZIP files found in the input directory.")
+        print("No ZIP files selected or found.")
         return
 
     # Collect all base paths from all ZIP files

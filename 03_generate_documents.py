@@ -57,7 +57,13 @@ def find_concatenated_md(subfolder):
     Identifies the concatenated Markdown file in the 'md' subfolder.
     Assumes the file starts with '__' and ends with '.md'.
     """
-    md_subfolder = os.path.join(subfolder, 'md')
+    # Support being passed either the document folder (containing an 'md' subfolder)
+    # or the 'md' folder itself.
+    if os.path.basename(os.path.normpath(subfolder)) == 'md':
+        md_subfolder = subfolder
+    else:
+        md_subfolder = os.path.join(subfolder, 'md')
+
     if not os.path.isdir(md_subfolder):
         return None
 
@@ -189,23 +195,25 @@ def generate_documents(args, logger):
         logger.error(f"Input folder '{input_folder}' does not exist or is not a directory.")
         return
 
-    # Identify all subfolders in the input folder
+    # Identify all subfolders in the input folder (exclude the generated 'md' folder)
     subfolders = [
         os.path.join(input_folder, name) for name in os.listdir(input_folder)
-        if os.path.isdir(os.path.join(input_folder, name))
+        if os.path.isdir(os.path.join(input_folder, name)) and name != 'md'
     ]
 
-    if not subfolders:
-        logger.warning(f"No subfolders found in '{input_folder}'. Exiting.")
-        return
+    # Also include the input folder itself as a candidate (in case it is a single document folder)
+    candidates = [input_folder] + subfolders
 
     # Prepare a list of tasks
     tasks = []
-    for subfolder in subfolders:
+    for subfolder in candidates:
         md_file = find_concatenated_md(subfolder)
         if md_file:
+            # Determine if the candidate is the 'md' folder itself
+            is_md_folder = os.path.basename(os.path.normpath(subfolder)) == 'md'
+
             # Extract base folder name for metadata
-            base_folder_name = os.path.basename(subfolder.rstrip('/\\'))
+            base_folder_name = os.path.basename(os.path.dirname(subfolder) if is_md_folder else subfolder.rstrip('/\\'))
             document_name, version = extract_metadata(base_folder_name)
             # Combine document name with version for the title
             combined_title = f"{document_name} {version}".strip()
@@ -216,8 +224,8 @@ def generate_documents(args, logger):
             }
 
             # Generate files inside the md folder where images reside
-            md_folder = os.path.join(subfolder, 'md')
-            final_output_dir = output_folder if output_folder else subfolder
+            md_folder = subfolder if is_md_folder else os.path.join(subfolder, 'md')
+            final_output_dir = output_folder if output_folder else (os.path.dirname(subfolder) if is_md_folder else subfolder)
 
             # Add to tasks
             tasks.append((md_file, md_folder, final_output_dir, formats, metadata))

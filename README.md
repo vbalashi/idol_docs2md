@@ -13,6 +13,30 @@ This project contains a set of Python scripts designed to convert MadCap Flare d
   - tqdm
   - pandoc (system requirement for document generation)
 
+## Environment Setup
+
+Use the provided helper script to create/update a virtual environment, install dependencies, and activate the environment.
+
+```bash
+# from the project root
+source scripts/activate_env.sh
+```
+
+What the script does:
+- Creates `.venv` if it does not exist (prefers `uv venv` if available, otherwise uses `python3 -m venv`).
+- Ensures `pip` is available and upgrades `pip/setuptools/wheel`.
+- Installs `requirements.txt` (prefers `uv pip install`, otherwise uses `pip`).
+- Activates the environment so subsequent `python`/`pip` refer to the project venv.
+
+If you prefer manual steps instead:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
 ## Scripts Overview
 
 The conversion process is split into four main scripts that should be run in sequence:
@@ -21,10 +45,13 @@ The conversion process is split into four main scripts that should be run in seq
 Extracts content from MadCap Flare ZIP files, focusing on the 'Content' and 'Data' directories.
 
 ```bash
-python 01_extract_zips.py <input_directory> [-o <output_directory>]
+python 01_extract_zips.py <zip_or_dir> [<zip_or_dir> ...] [-o <output_directory>]
 ```
-- `input_directory`: Directory containing the ZIP files
-- `output_directory`: Optional. Where to extract the files (defaults to ./mfdocs)
+- `zip_or_dir`: One or more paths; each can be a `.zip` file or a directory containing ZIPs
+- `output_directory`: Optional. Where to extract the files. If omitted, you will be prompted (default: `./mfdocs`).
+
+Interactive behavior:
+- When directories are provided, the script lists discovered ZIPs and allows you to select which ones to process (e.g., `1,3-5`). Press Enter to select all, or `0` to skip directory ZIPs.
 
 ### 2. Convert to Markdown (`02_convert_to_md.py`)
 Converts the extracted HTML files to Markdown format while preserving the document structure.
