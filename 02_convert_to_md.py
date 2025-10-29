@@ -83,39 +83,57 @@ def process_base_folder(base_folder, image_extensions, max_workers):
     images_dir = os.path.join(md_dir, 'images')
     os.makedirs(images_dir, exist_ok=True)
 
-    # Copy images
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(tqdm(
-            executor.map(lambda img: copy_image(img, images_dir),
-                        images),
-            total=len(images),
-            desc=f'Copying images in {base_folder}'
-        ))
+    # Attach a per-base-folder file logger and ensure cleanup
+    file_handler = None
+    try:
+        log_path = os.path.join(md_dir, 'generate_documents.log')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(levelname)s:%(message)s'))
+        logger.addHandler(file_handler)
 
-    # Convert HTML files to Markdown
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(tqdm(
-            executor.map(lambda html: convert_html_to_md(html, base_folder, md_dir),
-                        html_files),
-            total=len(html_files),
-            desc=f'Converting HTML to Markdown in {base_folder}'
-        ))
+        # Copy images
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(tqdm(
+                executor.map(lambda img: copy_image(img, images_dir),
+                            images),
+                total=len(images),
+                desc=f'Copying images in {base_folder}'
+            ))
 
-    # Parse TOC files
-    toc_pairs = extract_tocs(base_folder)
-    if toc_pairs:
-        parse_toc_files(toc_pairs, base_folder, md_dir)
-        # Adjust headers after TOC parsing
-        adjust_headers(md_dir)
-        # Generate concatenated Markdown file
-        concatenated_md_path = generate_concatenated_md(base_folder, md_dir)
-        # Update internal links in the concatenated file
-        if concatenated_md_path:
-            update_internal_links(concatenated_md_path)
-            # Centralize assets into md/assets and rewrite references
-            unify_assets(concatenated_md_path, md_dir)
-    else:
-        logger.warning(f"No TOC files found in {base_folder}")
+        # Convert HTML files to Markdown
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(tqdm(
+                executor.map(lambda html: convert_html_to_md(html, base_folder, md_dir),
+                            html_files),
+                total=len(html_files),
+                desc=f'Converting HTML to Markdown in {base_folder}'
+            ))
+
+        # Parse TOC files
+        toc_pairs = extract_tocs(base_folder)
+        if toc_pairs:
+            parse_toc_files(toc_pairs, base_folder, md_dir)
+            # Adjust headers after TOC parsing
+            adjust_headers(md_dir)
+            # Generate concatenated Markdown file
+            concatenated_md_path = generate_concatenated_md(base_folder, md_dir)
+            # Update internal links in the concatenated file
+            if concatenated_md_path:
+                update_internal_links(concatenated_md_path)
+                # Validate anchors used vs available
+                validate_internal_anchors(concatenated_md_path)
+                # Centralize assets into md/assets and rewrite references
+                unify_assets(concatenated_md_path, md_dir)
+        else:
+            logger.warning(f"No TOC files found in {base_folder}")
+    finally:
+        if file_handler is not None:
+            try:
+                logger.removeHandler(file_handler)
+                file_handler.close()
+            except Exception:
+                pass
 
 def copy_image(src, images_dir):
     try:
@@ -504,6 +522,22 @@ def generate_concatenated_md(base_folder, md_dir):
         with open(toc_txt_path, 'r', encoding='utf-8') as toc_file:
             md_files = [line.strip() for line in toc_file if line.strip()]
 
+        # Include additional markdown files not present in __toc.txt to ensure
+        # anchors exist for pages referenced but not listed in the TOC
+        all_md_files = []
+        for root, dirs, files in os.walk(md_dir):
+            for file in files:
+                if file.lower().endswith('.md') and not file.startswith('__'):
+                    abs_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(abs_path, md_dir).replace('\\', '/')
+                    if rel_path == concatenated_filename:
+                        continue
+                    all_md_files.append(rel_path)
+        missing_md_files = [p for p in sorted(set(all_md_files)) if p not in md_files]
+        for extra in missing_md_files:
+            logger.info(f"Appending non-TOC markdown file to concatenation: {extra}")
+        md_files = md_files + missing_md_files
+
         # Safeguard dedupe
         seen_concat = set()
 
@@ -545,8 +579,10 @@ def generate_concatenated_md(base_folder, md_dir):
                     if m:
                         first_header_title = m.group(2).strip()
                         break
+                anchor_for_file = None
                 if first_header_title:
                     anchor = unique_anchor_for_title(first_header_title)
+                    anchor_for_file = anchor
                     rel_key = md_file.replace('\\', '/')
                     anchors_by_rel_path[rel_key] = anchor
                     base_name = os.path.splitext(os.path.basename(rel_key))[0]
@@ -565,15 +601,15 @@ def generate_concatenated_md(base_folder, md_dir):
                     unique_fallback = base if count == 0 else f"{base}-{count}"
                     title_counts[base] = count + 1
                     anchors_by_rel_path[rel_key] = unique_fallback
+                    anchor_for_file = unique_fallback
                     if base_name not in anchors_by_base_name:
                         anchors_by_base_name[base_name] = unique_fallback
 
                 # Optionally add a marker for easier debugging
                 concatenated_file.write(f"<!-- BEGIN_FILE: {md_file} -->\n")
-                # If we created a headerless fallback anchor for this file, inject it here
-                rel_key_check = md_file.replace('\\', '/')
-                if rel_key_check in anchors_by_rel_path and not first_header_title:
-                    concatenated_file.write(f"<a id=\"{anchors_by_rel_path[rel_key_check]}\"></a>\n")
+                # Inject an explicit anchor for this file's entry to guarantee linkability
+                if anchor_for_file:
+                    concatenated_file.write(f"<a id=\"{anchor_for_file}\"></a>\n")
                 concatenated_file.write(content)
                 concatenated_file.write('\n\n')  # Add separation between files
 
@@ -626,6 +662,59 @@ def update_internal_links(concatenated_md_path):
         # <!-- BEGIN_FILE: relative/path.md --> we resolve relative hrefs from that path
         begin_marker_re = re.compile(r'<!--\s*BEGIN_FILE:\s*(.*?)\s*-->')
         link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)')
+        hashlink_pattern = re.compile(r'\[([^\]]+)\]\(#([^)#\s]+)\)')
+
+        # Path normalization to handle URL-encoding and non-breaking spaces in converted content
+        def normalize_path_for_lookup(p: str) -> str:
+            try:
+                from urllib.parse import unquote
+            except Exception:
+                unquote = None
+            if p is None:
+                return p
+            p = p.replace('\\', '/')
+            if unquote:
+                try:
+                    p = unquote(p)
+                except Exception:
+                    pass
+            # Replace NBSP and collapse all whitespace to a single space
+            p = p.replace('\u00A0', ' ')
+            p = p.replace('\xa0', ' ')
+            p = re.sub(r'\s+', ' ', p)
+            return p.strip()
+
+        # Precompute header anchors across the whole document (positions and ids)
+        # so we can later remap in-document anchor links to the correct unique ids.
+        header_re_all = re.compile(r'^(#+)\s+(.*)$', re.MULTILINE)
+        title_counts_all = {}
+        anchor_positions = []  # list of (pos, anchor_id)
+        for m in header_re_all.finditer(content):
+            title = m.group(2).strip()
+            base = generate_markdown_anchor(title)
+            count = title_counts_all.get(base, 0)
+            anchor_id = base if count == 0 else f"{base}-{count}"
+            title_counts_all[base] = count + 1
+            anchor_positions.append((m.start(), anchor_id))
+
+        # Include explicitly injected anchors as well
+        for m in re.finditer(r'<a\s+id=\"([^\"]+)\"\s*>\s*</a>', content):
+            anchor_positions.append((m.start(), m.group(1)))
+
+        # Build lookup by base -> sorted list of (pos, anchor_id)
+        def anchor_base(a: str) -> str:
+            return re.sub(r'-\d+$', '', a)
+
+        anchors_by_base = {}
+        for pos, aid in anchor_positions:
+            b = anchor_base(aid)
+            lst = anchors_by_base.get(b, [])
+            lst.append((pos, aid))
+            anchors_by_base[b] = lst
+        for b in anchors_by_base:
+            anchors_by_base[b].sort(key=lambda x: x[0])
+
+        available_anchor_ids = set(aid for _, aid in anchor_positions)
 
         new_parts = []
         last_pos = 0
@@ -635,7 +724,7 @@ def update_internal_links(concatenated_md_path):
                 new_parts.append(content[last_pos:match.start()])
 
             marker_text = match.group(0)
-            source_rel = match.group(1).replace('\\', '/')
+            source_rel = normalize_path_for_lookup(match.group(1))
             new_parts.append(marker_text)
 
             # Determine the end of this block (next marker or EOF)
@@ -648,11 +737,11 @@ def update_internal_links(concatenated_md_path):
                 link_text = m.group(1)
                 href = m.group(2)
                 # Resolve href relative to the source file's directory
-                href_norm = href.replace('\\', '/')
+                href_norm = normalize_path_for_lookup(href)
                 # If already absolute (unlikely in our md), just normalize
-                rel_base = os.path.dirname(source_rel)
+                rel_base = normalize_path_for_lookup(os.path.dirname(source_rel))
                 resolved = os.path.normpath(os.path.join(rel_base, href_norm))
-                resolved = resolved.replace('\\', '/')
+                resolved = normalize_path_for_lookup(resolved)
 
                 anchor = anchors_by_rel.get(resolved)
                 if not anchor:
@@ -665,7 +754,38 @@ def update_internal_links(concatenated_md_path):
                     logger.warning(f"No anchor mapping for link to '{href}' (resolved from '{source_rel}' -> '{resolved}'). Leaving link unchanged.")
                     return m.group(0)
 
-            new_parts.append(link_pattern.sub(replace_link_ctx, block_text))
+            block_after_md = link_pattern.sub(replace_link_ctx, block_text)
+
+            # Remap in-document hash links to the correct unique anchor ids present in the doc
+            block_abs_start = match.end()
+            block_abs_end = next_match.start() if next_match else len(content)
+
+            def replace_hashlink_ctx(m):
+                link_text = m.group(1)
+                ref = m.group(2)
+                # If already a valid anchor id, keep it
+                if ref in available_anchor_ids:
+                    return m.group(0)
+                # Normalize to base
+                base = generate_markdown_anchor(ref)
+                base = anchor_base(base)
+                candidates = anchors_by_base.get(base, [])
+                if not candidates:
+                    return m.group(0)
+                # Prefer anchors within the same block
+                in_block = [(pos, aid) for (pos, aid) in candidates if block_abs_start <= pos < block_abs_end]
+                chosen = None
+                if in_block:
+                    chosen = in_block[0][1]
+                else:
+                    # Choose nearest by absolute position to the start of the block
+                    def dist(t):
+                        return abs(t[0] - block_abs_start)
+                    chosen = min(candidates, key=dist)[1]
+                return f'[{link_text}](#{chosen})'
+
+            block_after_hash = hashlink_pattern.sub(replace_hashlink_ctx, block_after_md)
+            new_parts.append(block_after_hash)
             last_pos = block_end
 
         # Append any trailing content after the last marker
@@ -674,8 +794,75 @@ def update_internal_links(concatenated_md_path):
 
         updated_content = ''.join(new_parts)
 
+        # Final global fallback pass: attempt to resolve any remaining .md links
+        # by trying common-normalized candidates against anchors_by_rel and by_base.
+        # This helps when a block could not be context-resolved for any reason.
+        def global_replace(m):
+            link_text = m.group(1)
+            href = m.group(2)
+            href_norm = normalize_path_for_lookup(href)
+
+            # If we can find an exact rel match, use it
+            if href_norm in anchors_by_rel:
+                return f'[{link_text}](#{anchors_by_rel[href_norm]})'
+
+            # Try stripping leading ./ and ../ segments progressively and prefixing with 'Content/'
+            candidate = href_norm
+            while candidate.startswith('../'):
+                candidate = candidate[3:]
+            candidate = candidate.lstrip('./')
+
+            # Try with and without 'Content/' prefix
+            possible_keys = [candidate]
+            if not candidate.startswith('Content/'):
+                possible_keys.append(f'Content/{candidate}')
+
+            for key in possible_keys:
+                key = normalize_path_for_lookup(os.path.normpath(key))
+                if key in anchors_by_rel:
+                    return f'[{link_text}](#{anchors_by_rel[key]})'
+
+            # Fallback to basename mapping
+            base_name = os.path.splitext(os.path.basename(href_norm))[0]
+            anchor = anchors_by_base.get(base_name)
+            if anchor:
+                return f'[{link_text}](#{anchor})'
+
+            logger.warning(f"Global fallback could not map link '{href}'. Leaving unchanged.")
+            return m.group(0)
+
+        updated_content = re.sub(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)', global_replace, updated_content)
+
+        # Global pass to remap any remaining in-document anchor links to the nearest matching heading id
+        # Useful for content that appears before the first BEGIN_FILE marker or edge cases
+        def replace_hashlink_global(m):
+            link_text = m.group(1)
+            ref = m.group(2)
+            if ref in available_anchor_ids:
+                return m.group(0)
+            base = anchor_base(generate_markdown_anchor(ref))
+            candidates = anchors_by_base.get(base, [])
+            if not candidates:
+                return m.group(0)
+            # Without precise position context, choose the first occurrence
+            return f'[{link_text}](#{candidates[0][1]})'
+
+        updated_content = hashlink_pattern.sub(replace_hashlink_global, updated_content)
+
         with open(concatenated_md_path, 'w', encoding='utf-8') as f:
             f.write(updated_content)
+
+        # Emit a report of any remaining .md links that were not converted
+        unresolved = set(m.group(2) for m in re.finditer(r'\[[^\]]+\]\(([^)]+\.md)(#[^)]+)?\)', updated_content))
+        report_path = os.path.join(md_dir, '__link_warnings.txt')
+        with open(report_path, 'w', encoding='utf-8') as rf:
+            rf.write(f"Unresolved .md links remaining: {len(unresolved)}\n")
+            for href in sorted(unresolved):
+                rf.write(f"- {href}\n")
+        if unresolved:
+            logger.warning(f"Unresolved .md links reported to {report_path}")
+        else:
+            logger.info("All .md links successfully converted to anchors.")
 
         logger.info(f"Internal links updated in concatenated Markdown file: {concatenated_md_path}")
 
@@ -699,14 +886,16 @@ def unify_assets(concatenated_md_path, md_dir, assets_dirname="assets"):
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Find image references ![alt](path)
-        img_pattern = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
+        # Find image references ![alt](url "optional title")
+        img_pattern = re.compile(r'!\[([^\]]*)\]\((\S+?)(?:\s+\"([^\"]*)\")?\)')
 
         def is_external(path):
             return re.match(r'^(?:http|https|data|mailto):', path, re.IGNORECASE) is not None
 
         def rewrite_img(match):
-            src = match.group(1)
+            alt_text = match.group(1)
+            src = match.group(2)
+            title = match.group(3)
             src_norm = src.replace('\\', '/')
             if is_external(src_norm):
                 return match.group(0)
@@ -735,7 +924,11 @@ def unify_assets(concatenated_md_path, md_dir, assets_dirname="assets"):
                 logger.warning(f"Failed to copy image {src_abs} -> {dest_path}: {e}")
                 return match.group(0)
 
-            return match.group(0).replace(src, f"{assets_dirname}/{name}")
+            # Reconstruct the image markdown preserving alt and title
+            if title is not None and title != '':
+                return f'![{alt_text}]({assets_dirname}/{name} "{title}")'
+            else:
+                return f'![{alt_text}]({assets_dirname}/{name})'
 
         updated_content = img_pattern.sub(rewrite_img, content)
 
@@ -745,6 +938,54 @@ def unify_assets(concatenated_md_path, md_dir, assets_dirname="assets"):
         logger.info(f"Assets unified under {assets_dir}")
     except Exception as e:
         logger.error(f"Error unifying assets for {concatenated_md_path}: {e}\n{traceback.format_exc()}")
+
+def validate_internal_anchors(concatenated_md_path):
+    """
+    Validates that all in-document anchor links point to existing anchors.
+    Writes a report to md/__anchor_warnings.txt with any missing anchors.
+    """
+    try:
+        if not os.path.exists(concatenated_md_path):
+            logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
+            return
+
+        md_dir = os.path.dirname(concatenated_md_path)
+        with open(concatenated_md_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Collect explicit anchors from <a id="..."></a>
+        explicit_ids = set(m.group(1) for m in re.finditer(r'<a\s+id=\"([^\"]+)\"\s*>\s*</a>', content))
+
+        # Collect anchors from headers, applying GitHub-style slug and duplicate suffixing
+        header_re = re.compile(r'^(#+)\s+(.*)$', re.MULTILINE)
+        title_counts = {}
+        header_ids = set()
+        for m in header_re.finditer(content):
+            title = m.group(2).strip()
+            base = generate_markdown_anchor(title)
+            count = title_counts.get(base, 0)
+            anchor = base if count == 0 else f"{base}-{count}"
+            title_counts[base] = count + 1
+            header_ids.add(anchor)
+
+        available = explicit_ids.union(header_ids)
+
+        # Find all #anchor references in links
+        ref_re = re.compile(r'\[[^\]]*\]\(#([^)#\s]+)\)')
+        referenced = set(m.group(1) for m in ref_re.finditer(content))
+
+        missing = sorted(ref for ref in referenced if ref not in available)
+        report_path = os.path.join(md_dir, '__anchor_warnings.txt')
+        with open(report_path, 'w', encoding='utf-8') as rf:
+            rf.write(f"Missing anchors: {len(missing)}\n")
+            for a in missing:
+                rf.write(f"- #{a}\n")
+        if missing:
+            logger.warning(f"Missing anchors reported to {report_path}")
+        else:
+            logger.info("All anchor links resolve to existing anchors.")
+    except Exception as e:
+        logger.error(f"Error validating anchors for {concatenated_md_path}: {e}\n{traceback.format_exc()}")
 
 def generate_markdown_anchor(title):
     """
