@@ -10,6 +10,7 @@ import json
 import logging
 import traceback
 from markdownify import markdownify as md
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
@@ -111,6 +112,8 @@ def process_base_folder(base_folder, image_extensions, max_workers):
         # Update internal links in the concatenated file
         if concatenated_md_path:
             update_internal_links(concatenated_md_path)
+            # Centralize assets into md/assets and rewrite references
+            unify_assets(concatenated_md_path, md_dir)
     else:
         logger.warning(f"No TOC files found in {base_folder}")
 
@@ -361,16 +364,26 @@ def parse_toc_files(toc_pairs, base_path, md_folder):
         tree_nodes = toc.get('tree', {}).get('n', [])
         traverse_tree(tree_nodes, id_to_info, toc_filenames, hierarchy_entries, base_path, md_folder)
 
-    # Write __toc.txt
+    # Write __toc.txt (deduplicated, preserve first occurrence order)
     toc_txt_path = os.path.join(md_folder, '__toc.txt')
+    seen_toc = set()
     with open(toc_txt_path, 'w', encoding='utf-8') as toc_file:
         for filename in toc_filenames:
+            if filename in seen_toc:
+                logger.info(f"Duplicate TOC entry skipped: {filename}")
+                continue
+            seen_toc.add(filename)
             toc_file.write(f"{filename}\n")
 
-    # Write __hierarchy.txt
+    # Write __hierarchy.txt (deduplicated on filename, keep first occurrence's level)
     hierarchy_txt_path = os.path.join(md_folder, '__hierarchy.txt')
+    seen_h = set()
     with open(hierarchy_txt_path, 'w', encoding='utf-8') as hierarchy_file:
         for filename, level in hierarchy_entries:
+            if filename in seen_h:
+                logger.info(f"Duplicate hierarchy entry skipped: {filename}")
+                continue
+            seen_h.add(filename)
             hashes = '#' * level
             hierarchy_file.write(f"{hashes} {filename}\n")
 
@@ -473,6 +486,9 @@ def generate_concatenated_md(base_folder, md_dir):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
     by concatenating all Markdown files listed in __toc.txt in order.
+    - Skips duplicate entries as a safeguard
+    - Builds an anchor mapping for each file's first header, handling duplicate headers by adding numeric suffixes
+    Persists anchor mapping to md/__anchors.json for later link rewriting.
     Returns the path to the concatenated file if successful, else None.
     """
     try:
@@ -488,8 +504,32 @@ def generate_concatenated_md(base_folder, md_dir):
         with open(toc_txt_path, 'r', encoding='utf-8') as toc_file:
             md_files = [line.strip() for line in toc_file if line.strip()]
 
+        # Safeguard dedupe
+        seen_concat = set()
+
+        # For building anchors consistent with GitHub duplicate heading behavior
+        header_pattern = re.compile(r'^(#+)\s+(.*)')
+        title_counts = {}
+        anchors_by_rel_path = {}
+        anchors_by_base_name = {}
+
+        def base_anchor_from_title(title):
+            return generate_markdown_anchor(title)
+
+        def unique_anchor_for_title(title):
+            base = base_anchor_from_title(title)
+            count = title_counts.get(base, 0)
+            anchor = base if count == 0 else f"{base}-{count}"
+            title_counts[base] = count + 1
+            return anchor
+
         with open(concatenated_file_path, 'w', encoding='utf-8') as concatenated_file:
             for md_file in md_files:
+                if md_file in seen_concat:
+                    logger.info(f"Duplicate entry in __toc.txt skipped during concatenation: {md_file}")
+                    continue
+                seen_concat.add(md_file)
+
                 md_file_path = os.path.join(md_dir, md_file)
                 if not os.path.exists(md_file_path):
                     logger.warning(f"Markdown file {md_file_path} listed in __toc.txt does not exist. Skipping.")
@@ -498,8 +538,39 @@ def generate_concatenated_md(base_folder, md_dir):
                 with open(md_file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
 
+                # Determine first header title for this file to compute anchor
+                first_header_title = None
+                for line in content.splitlines():
+                    m = header_pattern.match(line)
+                    if m:
+                        first_header_title = m.group(2).strip()
+                        break
+                if first_header_title:
+                    anchor = unique_anchor_for_title(first_header_title)
+                    rel_key = md_file.replace('\\', '/')
+                    anchors_by_rel_path[rel_key] = anchor
+                    base_name = os.path.splitext(os.path.basename(rel_key))[0]
+                    # Only set base_name mapping if unseen to prefer first occurrence
+                    if base_name not in anchors_by_base_name:
+                        anchors_by_base_name[base_name] = anchor
+                else:
+                    logger.warning(f"No header found in {md_file_path}; anchor mapping will be unavailable for this file.")
+
+                # Optionally add a marker for easier debugging
+                concatenated_file.write(f"<!-- BEGIN_FILE: {md_file} -->\n")
                 concatenated_file.write(content)
                 concatenated_file.write('\n\n')  # Add separation between files
+
+        # Persist anchor mapping
+        anchors_path = os.path.join(md_dir, '__anchors.json')
+        try:
+            with open(anchors_path, 'w', encoding='utf-8') as af:
+                json.dump({
+                    'by_rel_path': anchors_by_rel_path,
+                    'by_base_name': anchors_by_base_name
+                }, af, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to write anchor mapping to {anchors_path}: {e}")
 
         logger.info(f"Concatenated Markdown file created at: {concatenated_file_path}")
         return concatenated_file_path
@@ -511,59 +582,124 @@ def generate_concatenated_md(base_folder, md_dir):
 def update_internal_links(concatenated_md_path):
     """
     Updates internal links in the concatenated Markdown file to point to internal headers.
-    For example, converts [User Roles](../User_Roles.md) to [User Roles](#user-roles)
+    Uses md/__anchors.json (built during concatenation) to map .md links to anchors.
+    Example: [User Roles](../User_Roles.md) -> [User Roles](#user-roles)
     """
     try:
         if not os.path.exists(concatenated_md_path):
             logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
             return
 
+        md_dir = os.path.dirname(concatenated_md_path)
+        anchors_path = os.path.join(md_dir, '__anchors.json')
+        anchors_by_rel = {}
+        anchors_by_base = {}
+        if os.path.exists(anchors_path):
+            try:
+                with open(anchors_path, 'r', encoding='utf-8') as af:
+                    anchor_data = json.load(af)
+                    anchors_by_rel = anchor_data.get('by_rel_path', {})
+                    anchors_by_base = anchor_data.get('by_base_name', {})
+            except Exception as e:
+                logger.error(f"Failed to read anchor mapping at {anchors_path}: {e}")
+
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+            content = f.read()
 
-        # First pass: Build a mapping of header titles to anchors
-        header_pattern = re.compile(r'^(#+)\s+(.*)')
-        title_to_anchor = {}
-        for line in lines:
-            header_match = header_pattern.match(line)
-            if header_match:
-                hashes, title = header_match.groups()
-                # Generate anchor as per GitHub's markdown convention
-                anchor = generate_markdown_anchor(title)
-                title_to_anchor[title.strip()] = anchor
+        # Replace links pointing to markdown files with internal anchors
+        # This regex handles paths with spaces. Parentheses inside paths are not supported.
+        link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)')
 
-        # Second pass: Replace links pointing to markdown files with internal anchors
-        link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)\)')
+        def replace_link(match):
+            link_text = match.group(1)
+            href = match.group(2)
+            # Normalize href for rel-path lookup
+            href_norm = href.replace('\\', '/')
+            base_name = os.path.splitext(os.path.basename(href_norm))[0]
 
-        updated_lines = []
-        for line in lines:
-            def replace_link(match):
-                link_text = match.group(1)
-                href = match.group(2)
-                # Extract the base filename without path and extension
-                base_filename = os.path.splitext(os.path.basename(href))[0]
+            anchor = anchors_by_rel.get(href_norm)
+            if not anchor:
+                anchor = anchors_by_base.get(base_name)
 
-                # Attempt to find the corresponding header
-                # Assumption: Link text matches the header title
-                header_title = link_text.strip()
-                anchor = title_to_anchor.get(header_title)
-                if anchor:
-                    return f'[{link_text}](#{anchor})'
-                else:
-                    logger.warning(f"Could not find header for link text '{link_text}'. Leaving link unchanged.")
-                    return match.group(0)
+            if anchor:
+                return f'[{link_text}](#{anchor})'
+            else:
+                logger.warning(f"No anchor mapping for link to '{href}'. Leaving link unchanged.")
+                return match.group(0)
 
-            updated_line = link_pattern.sub(replace_link, line)
-            updated_lines.append(updated_line)
+        updated_content = link_pattern.sub(replace_link, content)
 
-        # Write back the updated content
         with open(concatenated_md_path, 'w', encoding='utf-8') as f:
-            f.writelines(updated_lines)
+            f.write(updated_content)
 
         logger.info(f"Internal links updated in concatenated Markdown file: {concatenated_md_path}")
 
     except Exception as e:
         logger.error(f"Error updating internal links in {concatenated_md_path}: {e}\n{traceback.format_exc()}")
+
+def unify_assets(concatenated_md_path, md_dir, assets_dirname="assets"):
+    """
+    Copies all local image assets referenced in the concatenated markdown file into md/assets/
+    and rewrites image references to point to that directory. Handles name collisions with a
+    short content-hash suffix.
+    """
+    try:
+        if not os.path.exists(concatenated_md_path):
+            logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
+            return
+
+        assets_dir = os.path.join(md_dir, assets_dirname)
+        os.makedirs(assets_dir, exist_ok=True)
+
+        with open(concatenated_md_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Find image references ![alt](path)
+        img_pattern = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
+
+        def is_external(path):
+            return re.match(r'^(?:http|https|data|mailto):', path, re.IGNORECASE) is not None
+
+        def rewrite_img(match):
+            src = match.group(1)
+            src_norm = src.replace('\\', '/')
+            if is_external(src_norm):
+                return match.group(0)
+
+            # Resolve source path relative to md_dir (where concatenated file lives)
+            src_abs = os.path.normpath(os.path.join(md_dir, src_norm))
+            if not os.path.isfile(src_abs):
+                logger.warning(f"Image not found for assets unification: {src_abs}")
+                return match.group(0)
+
+            # Determine destination filename, handle collisions by content hash
+            name = os.path.basename(src_abs)
+            dest_path = os.path.join(assets_dir, name)
+            if os.path.exists(dest_path):
+                # Compare content; if different, append short hash
+                with open(src_abs, 'rb') as rf:
+                    data = rf.read()
+                h = hashlib.sha1(data).hexdigest()[:8]
+                stem, ext = os.path.splitext(name)
+                name = f"{stem}-{h}{ext}"
+                dest_path = os.path.join(assets_dir, name)
+
+            try:
+                shutil.copy2(src_abs, dest_path)
+            except Exception as e:
+                logger.warning(f"Failed to copy image {src_abs} -> {dest_path}: {e}")
+                return match.group(0)
+
+            return match.group(0).replace(src, f"{assets_dirname}/{name}")
+
+        updated_content = img_pattern.sub(rewrite_img, content)
+
+        with open(concatenated_md_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+
+        logger.info(f"Assets unified under {assets_dir}")
+    except Exception as e:
+        logger.error(f"Error unifying assets for {concatenated_md_path}: {e}\n{traceback.format_exc()}")
 
 def generate_markdown_anchor(title):
     """
