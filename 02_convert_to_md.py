@@ -554,10 +554,26 @@ def generate_concatenated_md(base_folder, md_dir):
                     if base_name not in anchors_by_base_name:
                         anchors_by_base_name[base_name] = anchor
                 else:
-                    logger.warning(f"No header found in {md_file_path}; anchor mapping will be unavailable for this file.")
+                    # Headerless page: fallback to filename-based anchor and inject an anchor tag
+                    rel_key = md_file.replace('\\', '/')
+                    base_name = os.path.splitext(os.path.basename(rel_key))[0]
+                    # Create a filename-based anchor
+                    fallback_anchor = generate_markdown_anchor(base_name)
+                    # Ensure uniqueness across the doc
+                    base = fallback_anchor
+                    count = title_counts.get(base, 0)
+                    unique_fallback = base if count == 0 else f"{base}-{count}"
+                    title_counts[base] = count + 1
+                    anchors_by_rel_path[rel_key] = unique_fallback
+                    if base_name not in anchors_by_base_name:
+                        anchors_by_base_name[base_name] = unique_fallback
 
                 # Optionally add a marker for easier debugging
                 concatenated_file.write(f"<!-- BEGIN_FILE: {md_file} -->\n")
+                # If we created a headerless fallback anchor for this file, inject it here
+                rel_key_check = md_file.replace('\\', '/')
+                if rel_key_check in anchors_by_rel_path and not first_header_title:
+                    concatenated_file.write(f"<a id=\"{anchors_by_rel_path[rel_key_check]}\"></a>\n")
                 concatenated_file.write(content)
                 concatenated_file.write('\n\n')  # Add separation between files
 
@@ -606,28 +622,57 @@ def update_internal_links(concatenated_md_path):
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Replace links pointing to markdown files with internal anchors
-        # This regex handles paths with spaces. Parentheses inside paths are not supported.
+        # We now rewrite links in a context-aware manner: for each block beginning with
+        # <!-- BEGIN_FILE: relative/path.md --> we resolve relative hrefs from that path
+        begin_marker_re = re.compile(r'<!--\s*BEGIN_FILE:\s*(.*?)\s*-->')
         link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)')
 
-        def replace_link(match):
-            link_text = match.group(1)
-            href = match.group(2)
-            # Normalize href for rel-path lookup
-            href_norm = href.replace('\\', '/')
-            base_name = os.path.splitext(os.path.basename(href_norm))[0]
+        new_parts = []
+        last_pos = 0
+        for match in begin_marker_re.finditer(content):
+            # Append any text before this marker unchanged
+            if match.start() > last_pos:
+                new_parts.append(content[last_pos:match.start()])
 
-            anchor = anchors_by_rel.get(href_norm)
-            if not anchor:
-                anchor = anchors_by_base.get(base_name)
+            marker_text = match.group(0)
+            source_rel = match.group(1).replace('\\', '/')
+            new_parts.append(marker_text)
 
-            if anchor:
-                return f'[{link_text}](#{anchor})'
-            else:
-                logger.warning(f"No anchor mapping for link to '{href}'. Leaving link unchanged.")
-                return match.group(0)
+            # Determine the end of this block (next marker or EOF)
+            block_start = match.end()
+            next_match = begin_marker_re.search(content, block_start)
+            block_end = next_match.start() if next_match else len(content)
+            block_text = content[block_start:block_end]
 
-        updated_content = link_pattern.sub(replace_link, content)
+            def replace_link_ctx(m):
+                link_text = m.group(1)
+                href = m.group(2)
+                # Resolve href relative to the source file's directory
+                href_norm = href.replace('\\', '/')
+                # If already absolute (unlikely in our md), just normalize
+                rel_base = os.path.dirname(source_rel)
+                resolved = os.path.normpath(os.path.join(rel_base, href_norm))
+                resolved = resolved.replace('\\', '/')
+
+                anchor = anchors_by_rel.get(resolved)
+                if not anchor:
+                    base_name = os.path.splitext(os.path.basename(resolved))[0]
+                    anchor = anchors_by_base.get(base_name)
+
+                if anchor:
+                    return f'[{link_text}](#{anchor})'
+                else:
+                    logger.warning(f"No anchor mapping for link to '{href}' (resolved from '{source_rel}' -> '{resolved}'). Leaving link unchanged.")
+                    return m.group(0)
+
+            new_parts.append(link_pattern.sub(replace_link_ctx, block_text))
+            last_pos = block_end
+
+        # Append any trailing content after the last marker
+        if last_pos < len(content):
+            new_parts.append(content[last_pos:])
+
+        updated_content = ''.join(new_parts)
 
         with open(concatenated_md_path, 'w', encoding='utf-8') as f:
             f.write(updated_content)
@@ -722,17 +767,9 @@ def main():
                         help='List of image file extensions to include.')
     args = parser.parse_args()
 
-    # Get all subfolders (base folders), excluding output 'md' directories
-    base_folders = []
-    
-    # Always process the input folder itself first
-    base_folders.append(args.input_folder)
-    
-    # Add subdirectories, but exclude 'md' directories to avoid processing output as input
-    for name in os.listdir(args.input_folder):
-        subdir_path = os.path.join(args.input_folder, name)
-        if os.path.isdir(subdir_path) and name != 'md':
-            base_folders.append(subdir_path)
+    # Only process the input folder itself as a base folder.
+    # The recursive walkers inside processing will handle all nested content.
+    base_folders = [args.input_folder]
 
     if not base_folders:
         logger.error(f"No folders found to process in {args.input_folder}. Exiting.")
