@@ -11,7 +11,11 @@ This project contains a set of Python scripts designed to convert MadCap Flare d
   - js2py
   - markdownify
   - tqdm
-  - pandoc (system requirement for document generation)
+- System tools for document generation:
+  - pandoc
+  - For PDF output, either:
+    - A LaTeX engine (recommended): `xelatex`/`lualatex`/`pdflatex` (via TeX Live), or
+    - `wkhtmltopdf` (alternative HTML→PDF engine)
 
 ## Environment Setup
 
@@ -67,11 +71,15 @@ python 02_convert_to_md.py <input_folder> [--max_workers <num>] [--image_extensi
 Converts the Markdown files to EPUB, HTML, and/or PDF formats using pandoc.
 
 ```bash
-python 03_generate_documents.py <input_folder> [--output_folder <path>] [--formats <format1> <format2> ...]
+python 03_generate_documents.py <input_folder> \
+  [--output_folder <path>] \
+  [--formats <format1> <format2> ...] \
+  [--pdf_engine {auto,xelatex,lualatex,pdflatex,wkhtmltopdf}]
 ```
 - `input_folder`: Base folder containing the converted Markdown files
 - `output_folder`: Optional. Where to save the generated files
 - `formats`: Optional. Output formats to generate (choices: epub, html, pdf; default: all)
+- `pdf_engine`: Optional. PDF engine to use. `auto` picks the first available engine; default is `xelatex`.
 
 ### 4. Copy MD Files (`04_copy_md_files.py`)
 Copies all concatenated Markdown files (starting with '__') to a specified destination.
@@ -109,9 +117,54 @@ All scripts include error logging:
 - `extract_zip_errors.log` for ZIP extraction issues
 - `generate_documents.log` for document generation errors
 
+Additionally, `03_generate_documents.py` exits with a non-zero status code if required
+system tools are missing or if any conversion fails, and logs a per-format summary
+of successes/failures.
+
 ## Notes
 
 - The scripts assume a specific MadCap Flare documentation structure
 - Large documentation sets may require significant processing time
 - Pandoc must be installed separately for document generation
 - Some complex HTML elements may require manual review after conversion 
+
+## Installing System Dependencies (Arch Linux)
+
+Install pandoc and LaTeX (recommended for high-quality PDF via XeLaTeX):
+
+```bash
+sudo pacman -S --needed pandoc texlive-bin texlive-latex texlive-latexextra texlive-fontsextra
+```
+
+Recommended fonts (for better Unicode coverage):
+
+```bash
+sudo pacman -S --needed noto-fonts noto-fonts-cjk noto-fonts-emoji
+```
+
+Verify tools:
+
+```bash
+pandoc --version
+xelatex --version
+```
+
+Alternative PDF engine (wkhtmltopdf): not always available in official repos. Use AUR:
+
+- With an AUR helper (e.g., `yay` or `paru`):
+
+```bash
+yay -S wkhtmltopdf        # or: yay -S wkhtmltopdf-static
+# or
+paru -S wkhtmltopdf       # or: paru -S wkhtmltopdf-static
+```
+
+- Without an AUR helper:
+
+```bash
+git clone https://aur.archlinux.org/wkhtmltopdf.git
+cd wkhtmltopdf
+makepkg -si
+```
+
+Then run the generator with `--pdf_engine wkhtmltopdf` or simply use `--pdf_engine auto`.

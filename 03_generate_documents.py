@@ -6,6 +6,10 @@ import subprocess
 from tqdm import tqdm
 import logging
 import shutil
+import sys
+
+# Global selected PDF engine (set in main)
+ARGS_PDF_ENGINE = None
 
 # Configure logging to output to both console and a log file
 def setup_logging(log_file):
@@ -50,7 +54,64 @@ def parse_arguments():
         default=['epub', 'html', 'pdf'],
         help='Formats to generate. Choose from epub, html, pdf. Default is all three.'
     )
+    parser.add_argument(
+        '--pdf_engine',
+        type=str,
+        choices=['xelatex', 'lualatex', 'pdflatex', 'wkhtmltopdf', 'auto'],
+        default='xelatex',
+        help='PDF engine to use with pandoc. Use "auto" to pick the first available.'
+    )
     return parser.parse_args()
+
+def select_pdf_engine(preferred: str):
+    """
+    Decide which PDF engine to use. If preferred == 'auto', choose the first available
+    from ['xelatex', 'lualatex', 'pdflatex', 'wkhtmltopdf'].
+    Returns the chosen engine string or None if none are available.
+    """
+    if preferred != 'auto':
+        return preferred if shutil.which(preferred) else None
+
+    for engine in ['xelatex', 'lualatex', 'pdflatex', 'wkhtmltopdf']:
+        if shutil.which(engine):
+            return engine
+    return None
+
+def check_dependencies(formats, pdf_engine, logger):
+    """
+    Validate external tools (pandoc and the selected PDF engine when needed).
+    Returns (ok: bool, chosen_engine: Optional[str]).
+    """
+    ok = True
+    if shutil.which('pandoc') is None:
+        logger.error('pandoc not found in PATH. Please install pandoc and retry.')
+        ok = False
+    else:
+        # Verify pandoc can actually run (detects dynamic linking issues)
+        try:
+            subprocess.run(['pandoc', '--version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            logger.error('pandoc is present but failed to run. See details below and reinstall pandoc.')
+            # Best-effort to surface underlying stderr if available
+            if isinstance(e, subprocess.CalledProcessError):
+                logger.error(e.stderr.decode(errors='ignore').strip())
+            else:
+                logger.error(str(e))
+            ok = False
+
+    chosen_engine = None
+    if 'pdf' in formats:
+        chosen_engine = select_pdf_engine(pdf_engine)
+        if chosen_engine is None:
+            if pdf_engine == 'auto':
+                logger.error('No PDF engine found (tried xelatex, lualatex, pdflatex, wkhtmltopdf). Install one or set --pdf_engine.')
+            else:
+                logger.error(f"Selected PDF engine '{pdf_engine}' not found in PATH. Install it or choose another via --pdf_engine.")
+            ok = False
+        else:
+            logger.info(f"Using PDF engine: {chosen_engine}")
+
+    return ok, chosen_engine
 
 def find_concatenated_md(subfolder):
     """
@@ -90,7 +151,7 @@ def extract_metadata(base_folder_name):
         version = 'Unknown'
         return document_name, version
 
-def convert_markdown(md_file, output_dir, formats, metadata, logger):
+def convert_markdown(md_file, output_dir, formats, metadata, logger, pdf_engine):
     """
     Converts a Markdown file to specified formats using pandoc with metadata.
     """
@@ -99,6 +160,11 @@ def convert_markdown(md_file, output_dir, formats, metadata, logger):
     # Remove '__' prefix from the concatenated markdown filename
     if base_name_no_ext.startswith('__'):
         base_name_no_ext = base_name_no_ext[2:]
+
+    # Determine actual PDF engine to use (if needed)
+    chosen_engine = None
+    if 'pdf' in formats:
+        chosen_engine = select_pdf_engine(pdf_engine)
 
     # Prepare conversion commands
     conversion_commands = {
@@ -122,12 +188,14 @@ def convert_markdown(md_file, output_dir, formats, metadata, logger):
             '--toc',
             '--metadata', f'title={metadata["title"]}',
             '--metadata', f'version={metadata["version"]}',
-            '--pdf-engine=xelatex',
+        ] + ([f'--pdf-engine={chosen_engine}'] if chosen_engine else []) + [
             '-V', 'geometry:margin=0.75in',  # Smaller margins to ensure tables fit
             '-V', 'longtable=true',  # Use longtable package for better table handling
             '-o', os.path.join(output_dir, f"{base_name_no_ext}.pdf")
         ]
     }
+
+    results = {fmt: False for fmt in formats}
 
     for fmt in formats:
         cmd = conversion_commands.get(fmt)
@@ -136,8 +204,12 @@ def convert_markdown(md_file, output_dir, formats, metadata, logger):
                 # Change directory to output_dir (md folder) to correctly reference images
                 subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=output_dir)
                 logger.info(f"Converted '{md_file}' to {fmt.upper()}.")
+                results[fmt] = True
             except subprocess.CalledProcessError as e:
                 logger.error(f"Error converting '{md_file}' to {fmt.upper()}:\n{e.stderr.decode().strip()}")
+                results[fmt] = False
+
+    return results
 
 def move_generated_files(output_dir, final_output_dir, formats, base_name_no_ext, logger):
     """
@@ -252,8 +324,20 @@ def generate_documents(args, logger):
             for (md_file, md_folder, final_output_dir, fmts, metadata) in tasks
         ]
 
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc='Generating Documents'):
-            pass  # Progress bar updates automatically
+        summary = {fmt: {'success': 0, 'failure': 0} for fmt in formats}
+        for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc='Generating Documents'):
+            result = fut.result()
+            if result is None:
+                continue
+            for fmt, ok in result.items():
+                if fmt not in summary:
+                    summary[fmt] = {'success': 0, 'failure': 0}
+                if ok:
+                    summary[fmt]['success'] += 1
+                else:
+                    summary[fmt]['failure'] += 1
+
+    return summary
 
 def process_subfolder(md_file, md_folder, final_output_dir, formats, metadata, logger):
     """
@@ -272,11 +356,13 @@ def process_subfolder(md_file, md_folder, final_output_dir, formats, metadata, l
             return
 
         # Convert concatenated Markdown to desired formats
-        convert_markdown(concatenated_md_file, md_folder, formats, metadata, logger)
+        results = convert_markdown(concatenated_md_file, md_folder, formats, metadata, logger, pdf_engine=ARGS_PDF_ENGINE)
 
         # Move generated files from md folder to final output folder
         base_name_no_ext = os.path.splitext(os.path.basename(concatenated_md_file))[0][2:]  # Remove '__' prefix
         move_generated_files(md_folder, final_output_dir, formats, base_name_no_ext, logger)
+
+        return results
 
     except Exception as e:
         logger.error(f"Error processing subfolder '{os.path.dirname(os.path.dirname(md_file))}': {e}")
@@ -297,9 +383,24 @@ def main():
     logger.info(f"Output Folder: {args.output_folder if args.output_folder else 'Same as input subfolders'}")
     logger.info(f"Formats to Generate: {', '.join(args.formats)}")
 
-    generate_documents(args, logger)
+    ok, chosen_engine = check_dependencies(args.formats, args.pdf_engine, logger)
+    if not ok:
+        sys.exit(1)
 
-    logger.info("Document generation process completed.")
+    global ARGS_PDF_ENGINE
+    ARGS_PDF_ENGINE = chosen_engine if chosen_engine else args.pdf_engine
+
+    summary = generate_documents(args, logger)
+
+    if summary:
+        any_failures = any(v['failure'] > 0 for v in summary.values())
+        for fmt, stats in summary.items():
+            logger.info(f"{fmt.upper()}: {stats['success']} succeeded, {stats['failure']} failed")
+        if any_failures:
+            logger.error("Document generation completed with errors.")
+            sys.exit(2)
+
+    logger.info("Document generation process completed successfully.")
 
 if __name__ == '__main__':
     main()
