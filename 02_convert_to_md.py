@@ -564,6 +564,37 @@ def adjust_headers(md_dir):
         except Exception as e:
             logger.error(f"Error adjusting headers in {md_file_path}: {e}\n{traceback.format_exc()}")
 
+def infer_subfolder_from_path(file_path):
+    """
+    Infers the documentation subfolder from the file path for merged documents.
+    Used for IDOLServer documentation which combines expert, gettingstarted, and documentsecurity.
+    
+    Returns: subfolder name (expert, gettingstarted, documentsecurity) or None
+    """
+    # Normalize path
+    path_normalized = file_path.replace('\\', '/')
+    
+    # Extract the directory structure after "Content/"
+    if 'Content/' in path_normalized:
+        after_content = path_normalized.split('Content/', 1)[1]
+        parts = after_content.split('/')
+        if len(parts) > 0:
+            first_dir = parts[0]
+            
+            # Mapping based on observed patterns in IDOLServer documentation
+            expert_dirs = ['IDOLExpert', 'DocMap', 'Amazon EFS', 'FunctionalityView']
+            documentsecurity_dirs = ['IAS', 'StandardSecurity', 'OmniGroupServer', 'Appendixes', 'GenericSecurity', 'Resources']
+            gettingstarted_dirs = ['Install_Run_IDOL', 'IDOL_Systems']
+            
+            if first_dir in expert_dirs or 'Expert' in first_dir:
+                return 'expert'
+            elif first_dir in documentsecurity_dirs:
+                return 'documentsecurity'
+            elif first_dir in gettingstarted_dirs:
+                return 'gettingstarted'
+    
+    return None
+
 def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None, subfolder_name=None):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
@@ -680,14 +711,29 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                 # If online URL info is provided, rewrite the first header of this block to link to the online source
                 if online_base_url and online_site_dir:
                     rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
+                    
+                    # Try to infer subfolder from file path (for merged documents like IDOLServer)
+                    inferred_subfolder = infer_subfolder_from_path(md_file)
+                    
+                    # Use inferred subfolder if available, otherwise use the provided subfolder_name
+                    effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
+                    
                     # Determine correct path based on subfolder
-                    if subfolder_name:
+                    if effective_subfolder:
                         # Extract just the subfolder name (e.g., "gettingstarted" from "html/gettingstarted")
-                        subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
-                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{rel_html_path}"
+                        subfolder = effective_subfolder.split('/')[-1] if '/' in effective_subfolder else effective_subfolder
+                        
+                        # Special case: IDOLServer has a unique URL structure with /Guides/html/ prefix
+                        if 'IDOLServer' in online_site_dir:
+                            # IDOLServer structure: {base_url}/{doc_name}/Guides/html/{subfolder}/{rel_html_path}
+                            online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{rel_html_path}"
+                        else:
+                            # Standard structure: {base_url}/{doc_name}/{subfolder}/{rel_html_path}
+                            online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{rel_html_path}"
                     else:
-                        # Fallback to old path (shouldn't happen with new pipeline)
-                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{rel_html_path}"
+                        # Without subfolder: {base_url}/{doc_name}/Help/{rel_html_path}
+                        # The "Help" segment is part of the online documentation structure
+                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
                     rewritten = []
                     header_rewritten = False
                     for line in content.splitlines():
@@ -728,6 +774,7 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
     """
     Fixes cross-reference links to external documents (e.g., ../../Shared_Admin/..., ../../Actions/...).
     Converts them to online documentation URLs.
+    Context-aware: tracks which BEGIN_FILE block we're in to determine the correct subfolder for Shared_Admin links.
     """
     try:
         if not os.path.exists(concatenated_md_path):
@@ -745,9 +792,28 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
         # Examples: ../../Shared_Admin/_ADM_Config.htm, ../../Actions/Query/_IDOL_QUERY.htm
         cross_ref_pattern = re.compile(r'\[([^\]]+)\]\((\.\./\.\./[^)]+\.(htm|md)(?:#[^)]*)?)\)')
         
+        # Build a map of position -> context_subfolder by finding all BEGIN_FILE markers
+        begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:\s*([^\s]+)\s*-->')
+        context_map = []  # List of (position, inferred_subfolder)
+        for match in begin_file_pattern.finditer(content):
+            file_path = match.group(1)
+            context_subfolder = infer_subfolder_from_path(file_path)
+            context_map.append((match.start(), context_subfolder))
+        
+        def get_context_subfolder(pos):
+            """Get the subfolder context for a given position in the document."""
+            current_subfolder = subfolder_name
+            for start_pos, ctx_subfolder in context_map:
+                if start_pos <= pos:
+                    current_subfolder = ctx_subfolder if ctx_subfolder else current_subfolder
+                else:
+                    break
+            return current_subfolder
+        
         def replace_cross_ref(match):
             link_text = match.group(1)
             rel_path = match.group(2)
+            link_position = match.start()
             
             # Parse the path
             # Example: ../../Shared_Admin/_ADM_Config.htm#Section
@@ -758,14 +824,35 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
             # Remove leading ../../ and convert to proper path
             clean_path = file_path.replace('../', '').replace('.md', '.htm')
             
-            # Determine subfolder for URL
-            if subfolder_name:
-                subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
-                # Build online URL
-                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{clean_path}{anchor}"
+            # Special handling for Shared_Admin paths - they should be under Content/
+            # and use the CURRENT document's subfolder (from context), not inferred from Shared_Admin itself
+            is_shared_admin = clean_path.startswith('Shared_Admin/')
+            if is_shared_admin:
+                clean_path = f'Content/{clean_path}'
+            
+            # Try to infer subfolder from the cross-reference path
+            # For Shared_Admin, use the context subfolder instead of inferring
+            if is_shared_admin:
+                effective_subfolder = get_context_subfolder(link_position)
             else:
-                # Fallback to old path
-                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{clean_path}{anchor}"
+                inferred_subfolder = infer_subfolder_from_path(clean_path)
+                effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
+            
+            # Determine subfolder for URL
+            if effective_subfolder:
+                subfolder = effective_subfolder.split('/')[-1] if '/' in effective_subfolder else effective_subfolder
+                
+                # Special case: IDOLServer has a unique URL structure with /Guides/html/ prefix
+                if 'IDOLServer' in online_site_dir:
+                    # IDOLServer structure: {base_url}/{doc_name}/Guides/html/{subfolder}/{clean_path}
+                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{clean_path}{anchor}"
+                else:
+                    # Standard structure: {base_url}/{doc_name}/{subfolder}/{clean_path}
+                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{clean_path}{anchor}"
+            else:
+                # Without subfolder: {base_url}/{doc_name}/Help/{clean_path}
+                # The "Help" segment is part of the online documentation structure
+                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{clean_path}{anchor}"
             
             return f'[{link_text}]({online_url})'
         
