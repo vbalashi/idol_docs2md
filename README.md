@@ -43,9 +43,57 @@ python -m pip install -r requirements.txt
 
 ## Scripts Overview
 
-The project provides two workflows:
+The project provides three workflows:
 
-### Workflow A: All-in-One (Recommended for Online ZIPs)
+### Workflow A: Batch Pipeline with TUI (Recommended for Multiple Documents)
+
+**`04_pipeline.py`** - Scan documentation site, interactively select items, and batch process:
+
+```bash
+python 04_pipeline.py <documentation_index_url> [OPTIONS]
+```
+
+**Features:**
+- 🔍 Automatically discovers all available documentation ZIPs from a documentation index page
+- 🖥️ Interactive TUI (Terminal User Interface) for selecting items
+- 🔎 Vi-like search/filter: press `/` to search, filter results instantly
+- ⚡ Batch processing: convert multiple documentation packages in one run
+- 📊 Progress tracking and summary reports
+
+**Quick Example:**
+```bash
+# Scan Knowledge Discovery 25.4 documentation
+python 04_pipeline.py https://www.microfocus.com/documentation/idol/knowledge-discovery-25.4/
+
+# TUI will launch - use arrow keys to navigate, Space to select, Enter to confirm
+# Or use search: press '/', type "connector", press 'a' to select all connectors
+```
+
+**TUI Controls:**
+- `↑/↓` - Navigate items
+- `Space` - Toggle selection
+- `/` - Search/filter
+- `a` - Select all filtered items
+- `n` - Deselect all filtered items
+- `Enter` - Start processing
+- `q` - Quit
+
+**Command Options:**
+- `--no-tui`: Skip TUI and auto-process all found items
+- `--output_md_dir`: Custom output directory (default: `./md`)
+- `--force`: Force re-download existing ZIPs
+- `--max_workers`: Number of parallel conversion threads (default: 10)
+- `--copy_all_images_to_assets`: Include all images, even unreferenced ones
+
+**Documentation:**
+- Full guide: [PIPELINE_README.md](PIPELINE_README.md)
+- TUI interface guide: [TUI_GUIDE.md](TUI_GUIDE.md)
+- Examples: [EXAMPLES.md](EXAMPLES.md)
+- Quick reference: [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
+
+---
+
+### Workflow B: All-in-One Single Document (Recommended for Individual ZIPs)
 
 **`03_fetch_extract_convert.py`** - Download, extract, and convert in one step:
 
@@ -92,7 +140,7 @@ python 03_fetch_extract_convert.py \
 
 ---
 
-### Workflow B: Step-by-Step (For Local ZIPs or Custom Processing)
+### Workflow C: Step-by-Step (For Local ZIPs or Custom Processing)
 
 Use these scripts in sequence for more control:
 
@@ -143,19 +191,38 @@ python 04_copy_md_files.py <source_folder> [--destination_folder <path>]
 
 ## Features
 
-- **All-in-One Conversion**: Download, extract, and convert in a single command
-- **Clean Terminal Output**: Formatted output with progress bars, timing, and color coding
-- **Concurrent Processing**: Multi-threaded conversion for better performance
-- **Document Hierarchy**: Maintains document structure and generates table of contents
-- **Asset Management**: Automatic image handling and reference tracking
-- **Link Preservation**: Maintains internal and external links
-- **Comprehensive Logging**: Detailed logs for troubleshooting
-- **Flexible Workflows**: Choose between automated or step-by-step processing
-- **Metadata Extraction**: Automatic extraction from folder and file names
+- **🔄 Batch Pipeline**: Scan documentation sites and process multiple packages at once
+- **🖥️ Interactive TUI**: Vi-like interface with search/filter for easy selection
+- **📦 All-in-One Conversion**: Download, extract, and convert in a single command
+- **🎨 Clean Terminal Output**: Formatted output with progress bars, timing, and color coding
+- **⚡ Concurrent Processing**: Multi-threaded conversion for better performance
+- **📑 Document Hierarchy**: Maintains document structure and generates table of contents
+- **🖼️ Asset Management**: Automatic image handling and reference tracking
+- **🔗 Link Preservation**: Maintains internal and external links with online header links
+- **📝 Comprehensive Logging**: Detailed logs for troubleshooting
+- **🔧 Flexible Workflows**: Choose between batch pipeline, single document, or step-by-step processing
+- **🏷️ Metadata Extraction**: Automatic extraction from folder and file names
 
 ## Output Structure
 
-### Workflow A Output (All-in-One)
+### Workflow A Output (Batch Pipeline)
+```
+md/
+├── Content_25.4_Documentation.md
+├── Content_25.4_Documentation_assets/
+│   ├── image1.png
+│   ├── image2.jpg
+│   └── ...
+├── Community_25.4_Documentation.md
+├── Community_25.4_Documentation_assets/
+│   └── ...
+├── Category_25.4_Documentation.md
+├── Category_25.4_Documentation_assets/
+│   └── ...
+└── ...
+```
+
+### Workflow B Output (Single Document)
 ```
 md/
 ├── <DocName>.md                    # Single concatenated Markdown file
@@ -165,7 +232,7 @@ md/
     └── ...
 ```
 
-### Workflow B Output (Step-by-Step)
+### Workflow C Output (Step-by-Step)
 ```
 mfdocs/<DocSet>/
 ├── Content/                        # Original extracted HTML
