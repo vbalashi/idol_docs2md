@@ -684,10 +684,10 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                     if subfolder_name:
                         # Extract just the subfolder name (e.g., "gettingstarted" from "html/gettingstarted")
                         subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
-                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{rel_html_path}"
+                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{rel_html_path}"
                     else:
                         # Fallback to old path (shouldn't happen with new pipeline)
-                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
+                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{rel_html_path}"
                     rewritten = []
                     header_rewritten = False
                     for line in content.splitlines():
@@ -762,10 +762,10 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
             if subfolder_name:
                 subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
                 # Build online URL
-                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{clean_path}{anchor}"
+                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{clean_path}{anchor}"
             else:
-                # Fallback to Help path
-                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{clean_path}{anchor}"
+                # Fallback to old path
+                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{clean_path}{anchor}"
             
             return f'[{link_text}]({online_url})'
         
