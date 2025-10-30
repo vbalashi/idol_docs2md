@@ -65,7 +65,7 @@ def parse_js_define_call(js_content):
         logger.warning(f"Failed to parse JavaScript define call: {e}")
         return None
 
-def process_base_folder(base_folder, image_extensions, max_workers):
+def process_base_folder(base_folder, image_extensions, max_workers, online_base_url=None, online_site_dir=None, assets_dirname=None):
     images = []
     html_files = []
 
@@ -98,7 +98,8 @@ def process_base_folder(base_folder, image_extensions, max_workers):
                 executor.map(lambda img: copy_image(img, images_dir),
                             images),
                 total=len(images),
-                desc=f'Copying images in {base_folder}'
+                desc='  Copying images',
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]'
             ))
 
         # Convert HTML files to Markdown
@@ -107,7 +108,8 @@ def process_base_folder(base_folder, image_extensions, max_workers):
                 executor.map(lambda html: convert_html_to_md(html, base_folder, md_dir),
                             html_files),
                 total=len(html_files),
-                desc=f'Converting HTML to Markdown in {base_folder}'
+                desc='  Converting to MD',
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]'
             ))
 
         # Parse TOC files
@@ -117,14 +119,14 @@ def process_base_folder(base_folder, image_extensions, max_workers):
             # Adjust headers after TOC parsing
             adjust_headers(md_dir)
             # Generate concatenated Markdown file
-            concatenated_md_path = generate_concatenated_md(base_folder, md_dir)
+            concatenated_md_path = generate_concatenated_md(base_folder, md_dir, online_base_url=online_base_url, online_site_dir=online_site_dir)
             # Update internal links in the concatenated file
             if concatenated_md_path:
                 update_internal_links(concatenated_md_path)
                 # Validate anchors used vs available
                 validate_internal_anchors(concatenated_md_path)
                 # Centralize assets into md/assets and rewrite references
-                unify_assets(concatenated_md_path, md_dir)
+                unify_assets(concatenated_md_path, md_dir, assets_dirname=assets_dirname or "assets")
         else:
             logger.warning(f"No TOC files found in {base_folder}")
     finally:
@@ -500,7 +502,7 @@ def adjust_headers(md_dir):
         except Exception as e:
             logger.error(f"Error adjusting headers in {md_file_path}: {e}\n{traceback.format_exc()}")
 
-def generate_concatenated_md(base_folder, md_dir):
+def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
     by concatenating all Markdown files listed in __toc.txt in order.
@@ -610,7 +612,25 @@ def generate_concatenated_md(base_folder, md_dir):
                 # Inject an explicit anchor for this file's entry to guarantee linkability
                 if anchor_for_file:
                     concatenated_file.write(f"<a id=\"{anchor_for_file}\"></a>\n")
-                concatenated_file.write(content)
+                # If online URL info is provided, rewrite the first header of this block to link to the online source
+                if online_base_url and online_site_dir:
+                    rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
+                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
+                    rewritten = []
+                    header_rewritten = False
+                    for line in content.splitlines():
+                        m = header_pattern.match(line)
+                        if not header_rewritten and m:
+                            hashes = m.group(1)
+                            title = m.group(2).strip()
+                            rewritten.append(f"{hashes} [{title}]({online_url})")
+                            header_rewritten = True
+                        else:
+                            rewritten.append(line)
+                    content_to_write = "\n".join(rewritten)
+                else:
+                    content_to_write = content
+                concatenated_file.write(content_to_write)
                 concatenated_file.write('\n\n')  # Add separation between files
 
         # Persist anchor mapping
@@ -887,7 +907,8 @@ def unify_assets(concatenated_md_path, md_dir, assets_dirname="assets"):
             content = f.read()
 
         # Find image references ![alt](url "optional title")
-        img_pattern = re.compile(r'!\[([^\]]*)\]\((\S+?)(?:\s+\"([^\"]*)\")?\)')
+        # Updated pattern to handle paths with spaces
+        img_pattern = re.compile(r'!\[([^\]]*)\]\(([^)\s]+(?:\s+[^)\s]+)*?)(?:\s+\"([^\"]*)\")?\)')
 
         def is_external(path):
             return re.match(r'^(?:http|https|data|mailto):', path, re.IGNORECASE) is not None
@@ -1006,6 +1027,10 @@ def main():
     parser.add_argument('--max_workers', type=int, default=10, help='Maximum number of worker threads per base folder.')
     parser.add_argument('--image_extensions', nargs='+', default=['.jpg', '.jpeg', '.png', '.gif', '.bmp'],
                         help='List of image file extensions to include.')
+    parser.add_argument('--online_base_url', type=str, default=None,
+                        help='Base URL of the online documentation site (e.g., https://www.microfocus.com/documentation/idol/knowledge-discovery-25.4)')
+    parser.add_argument('--online_site_dir', type=str, default=None,
+                        help='Site directory segment for the ZIP (e.g., Content_25.4_Documentation)')
     args = parser.parse_args()
 
     # Only process the input folder itself as a base folder.
@@ -1023,7 +1048,14 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=base_folder_workers) as executor:
         # Use tqdm to show progress of base folder processing
         futures = {
-            executor.submit(process_base_folder, base_folder, args.image_extensions, args.max_workers): base_folder
+            executor.submit(
+                process_base_folder,
+                base_folder,
+                args.image_extensions,
+                args.max_workers,
+                args.online_base_url,
+                args.online_site_dir
+            ): base_folder
             for base_folder in base_folders
         }
 

@@ -1,9 +1,34 @@
-# Ignore everything
-*
-*/*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
 
-# But not these files...
-!*.py
+# Downloaded and extracted documentation
+tmp_downloads/
+tmp_extracts/
+mfdocs/
+
+# Generated output
+md/
+*.epub
+*.pdf
+*.html
+
+# Logs
+*.log
+
+# But keep these
 !README.md
 !requirements.txt
-!.gitignore 
+!.gitignore
+!*.py
+
+# Keep scripts directory
+!scripts/
+!scripts/*.sh 
