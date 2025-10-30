@@ -16,6 +16,45 @@ import hashlib
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
+# Blacklist patterns for files that should be excluded from concatenation
+# These files typically contain navigation elements, search forms, or other non-content pages
+BLACKLISTED_FILES = [
+    '_FT_SideNav_Startup.md',
+    'index.md',
+    'index_CSH.md',
+    'Default.md',
+    'Default_CSH.md',
+    'search-results.md',
+    'search.md',
+]
+
+def is_blacklisted(filepath):
+    """
+    Check if a filepath should be excluded from the TOC based on blacklist patterns.
+    
+    Args:
+        filepath: The relative markdown file path (e.g., 'Content/Shared_Admin/index.md')
+    
+    Returns:
+        True if the file should be excluded, False otherwise
+    """
+    # Get the basename of the file
+    basename = os.path.basename(filepath)
+    
+    # Check exact matches
+    if basename in BLACKLISTED_FILES:
+        logger.info(f"Blacklisted file excluded: {filepath}")
+        return True
+    
+    # Check for files in Shared_* directories (often contain cover pages/navigation)
+    if 'Shared_' in filepath or '/Shared_' in filepath or '\\Shared_' in filepath:
+        # Allow some shared content but exclude covers and navigation
+        if basename.startswith('_') or 'Cover' in basename or 'Nav' in basename:
+            logger.info(f"Blacklisted shared file excluded: {filepath}")
+            return True
+    
+    return False
+
 def parse_js_define_call(js_content):
     """
     Parse JavaScript files that contain define() calls with JSON-like objects.
@@ -127,6 +166,19 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
                 validate_internal_anchors(concatenated_md_path)
                 # Centralize assets into md/assets and rewrite references
                 unify_assets(concatenated_md_path, md_dir, assets_dirname=assets_dirname or "assets")
+                # Final cleanup: remove unwanted elements (navigation, search artifacts, etc.)
+                try:
+                    with open(concatenated_md_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    cleaned_content = clean_markdown_content(content)
+                    
+                    with open(concatenated_md_path, 'w', encoding='utf-8') as f:
+                        f.write(cleaned_content)
+                    
+                    logger.info(f"Cleaned unwanted elements from concatenated file")
+                except Exception as clean_error:
+                    logger.warning(f"Error during post-processing cleanup: {clean_error}")
         else:
             logger.warning(f"No TOC files found in {base_folder}")
     finally:
@@ -431,6 +483,14 @@ def traverse_tree(nodes, id_to_info, toc_filenames, hierarchy_entries, base_path
         filename_normalized = os.path.splitext(os.path.join(md_folder, relative_md_path))[0] + '.md'
         filename_normalized = os.path.relpath(filename_normalized, md_folder).replace('\\', '/')
 
+        # Check if this file should be blacklisted
+        if is_blacklisted(filename_normalized):
+            # Skip this file but continue with children
+            child_nodes = node.get('n', [])
+            if child_nodes:
+                traverse_tree(child_nodes, id_to_info, toc_filenames, hierarchy_entries, base_path, md_folder, level + 1)
+            continue
+
         # Append to TOC lists
         toc_filenames.append(filename_normalized)
         hierarchy_entries.append((filename_normalized, level))
@@ -533,6 +593,9 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                     abs_path = os.path.join(root, file)
                     rel_path = os.path.relpath(abs_path, md_dir).replace('\\', '/')
                     if rel_path == concatenated_filename:
+                        continue
+                    # Skip blacklisted files
+                    if is_blacklisted(rel_path):
                         continue
                     all_md_files.append(rel_path)
         missing_md_files = [p for p in sorted(set(all_md_files)) if p not in md_files]
@@ -1020,6 +1083,121 @@ def generate_markdown_anchor(title):
     # Replace spaces and underscores with hyphens
     anchor = re.sub(r'[\s_]+', '-', anchor)
     return anchor
+
+def clean_markdown_content(content):
+    """
+    Post-processes markdown content to remove unwanted elements:
+    1. Removes all BEGIN_FILE HTML comments (debugging markers)
+    2. Removes anchor tags immediately before headers
+    3. Removes search/navigation artifacts at the end
+    4. Removes unwanted navigation elements (Previous/Next links)
+    5. Removes embedded JavaScript code blocks
+    """
+    
+    # Pattern 1: Remove sections starting with blacklisted files that appear near the end
+    # Look for _FT_SideNav_Startup specifically (the most common footer marker)
+    sidenav_footer = re.compile(
+        r'<!--\s*BEGIN_FILE:\s*[^>]*?[/\\]_FT_SideNav_Startup\.md\s*-->\s*\n'
+        r'.*$',  # Everything from here to end
+        re.MULTILINE | re.DOTALL
+    )
+    
+    # Find the last occurrence (in case there are multiple)
+    matches = list(sidenav_footer.finditer(content))
+    if matches:
+        last_match = matches[-1]
+        # Only remove if in the last 5% of the document (to be safe)
+        threshold = int(len(content) * 0.95)
+        if last_match.start() >= threshold:
+            content = content[:last_match.start()]
+    
+    # Pattern 2: Remove footer sections with index.md or index_CSH.md near the end
+    index_footer = re.compile(
+        r'<!--\s*BEGIN_FILE:\s*[^>]*?[/\\]index(?:_CSH)?\.md\s*-->\s*\n'
+        r'.*$',
+        re.MULTILINE | re.DOTALL
+    )
+    matches = list(index_footer.finditer(content))
+    if matches:
+        last_match = matches[-1]
+        threshold = int(len(content) * 0.95)
+        if last_match.start() >= threshold:
+            content = content[:last_match.start()]
+    
+    # Pattern 3: Remove index_CSH sections with JavaScript (can appear anywhere)
+    js_csh_pattern = re.compile(
+        r'<!--\s*BEGIN_FILE:.*?index_CSH\.md\s*-->\s*\n'
+        r'<a\s+id=["\'].*?["\'].*?>\s*</a>\s*\n'
+        r'(?:.*?\n)*?'
+        r'//\]\]>\s*\n',
+        re.MULTILINE | re.DOTALL
+    )
+    content = js_csh_pattern.sub('', content)
+    
+    # Pattern 4: Remove ALL BEGIN_FILE comments throughout the document
+    # These are debugging markers that editors don't recognize as markdown
+    begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:.*?-->\s*\n', re.MULTILINE)
+    content = begin_file_pattern.sub('', content)
+    
+    # Pattern 5: Remove anchor tags that immediately precede headers
+    # This cleans up <a id="..."></a> tags that appear right before # headers
+    anchor_before_header = re.compile(
+        r'<a\s+id=["\']([^"\']+)["\'](?:\s+[^>]*)?>(?:</a>)?\s*\n'
+        r'(#+\s+)',
+        re.MULTILINE
+    )
+    content = anchor_before_header.sub(r'\2', content)
+    
+    # Pattern 5b: Remove standalone anchor tags (not followed by headers)
+    # These can appear at the start of files or standalone in content
+    standalone_anchor = re.compile(
+        r'<a\s+id=["\']([^"\']+)["\'](?:\s+[^>]*)?>(?:</a>)?\s*\n',
+        re.MULTILINE
+    )
+    content = standalone_anchor.sub('', content)
+    
+    # Pattern 6: Remove footer artifacts that include search results and navigation
+    footer_pattern = re.compile(
+        r'\n---\s*\n'                                   # Starting horizontal rule
+        r'#\s+Your search for.*?returned result.*?\n'  # Search results header
+        r'.*?'                                          # Any content
+        r'\[Previous\]\(#\)\[Next\]\(#\)\s*\n'         # Navigation links
+        r'.*$',                                         # Everything to the end
+        re.MULTILINE | re.DOTALL
+    )
+    content = footer_pattern.sub('', content)
+    
+    # Pattern 7: Remove standalone search/navigation sections
+    search_nav_pattern = re.compile(
+        r'---\s*\n'
+        r'#\s+Your search for.*?returned result.*?\n'
+        r'.*?'
+        r'\[Previous\]\(#\)\[Next\]\(#\)',
+        re.MULTILINE | re.DOTALL
+    )
+    content = search_nav_pattern.sub('', content)
+    
+    # Pattern 7b: Remove "Your search for" headers at the end (without --- prefix)
+    search_header_pattern = re.compile(
+        r'\n#\s+Your search for.*?returned result.*?\s*$',
+        re.MULTILINE | re.DOTALL
+    )
+    content = search_header_pattern.sub('', content)
+    
+    # Pattern 8: Remove orphaned navigation links
+    orphan_nav_pattern = re.compile(r'\[Previous\]\(#\)\s*\[Next\]\(#\)', re.MULTILINE)
+    content = orphan_nav_pattern.sub('', content)
+    
+    # Pattern 9: Remove excessive blank lines (more than 2 consecutive)
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    
+    # Pattern 10: Clean up trailing horizontal rules and whitespace
+    content = re.sub(r'\n---\s*$', '', content)
+    
+    # Trim leading and trailing whitespace
+    content = content.strip()
+    
+    return content
 
 def main():
     parser = argparse.ArgumentParser(description='Process folders to copy images and convert HTML to Markdown.')
