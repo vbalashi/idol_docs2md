@@ -104,7 +104,7 @@ def parse_js_define_call(js_content):
         logger.warning(f"Failed to parse JavaScript define call: {e}")
         return None
 
-def process_base_folder(base_folder, image_extensions, max_workers, online_base_url=None, online_site_dir=None, assets_dirname=None):
+def process_base_folder(base_folder, image_extensions, max_workers, online_base_url=None, online_site_dir=None, assets_dirname=None, subfolder_name=None):
     images = []
     html_files = []
 
@@ -158,10 +158,12 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
             # Adjust headers after TOC parsing
             adjust_headers(md_dir)
             # Generate concatenated Markdown file
-            concatenated_md_path = generate_concatenated_md(base_folder, md_dir, online_base_url=online_base_url, online_site_dir=online_site_dir)
+            concatenated_md_path = generate_concatenated_md(base_folder, md_dir, online_base_url=online_base_url, online_site_dir=online_site_dir, subfolder_name=subfolder_name)
             # Update internal links in the concatenated file
             if concatenated_md_path:
                 update_internal_links(concatenated_md_path)
+                # Fix cross-references to external documents
+                fix_cross_references(concatenated_md_path, online_base_url, online_site_dir, subfolder_name)
                 # Validate anchors used vs available
                 validate_internal_anchors(concatenated_md_path)
                 # Centralize assets into md/assets and rewrite references
@@ -562,7 +564,7 @@ def adjust_headers(md_dir):
         except Exception as e:
             logger.error(f"Error adjusting headers in {md_file_path}: {e}\n{traceback.format_exc()}")
 
-def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None):
+def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None, subfolder_name=None):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
     by concatenating all Markdown files listed in __toc.txt in order.
@@ -678,7 +680,14 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                 # If online URL info is provided, rewrite the first header of this block to link to the online source
                 if online_base_url and online_site_dir:
                     rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
-                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
+                    # Determine correct path based on subfolder
+                    if subfolder_name:
+                        # Extract just the subfolder name (e.g., "gettingstarted" from "html/gettingstarted")
+                        subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
+                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{rel_html_path}"
+                    else:
+                        # Fallback to old path (shouldn't happen with new pipeline)
+                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
                     rewritten = []
                     header_rewritten = False
                     for line in content.splitlines():
@@ -686,7 +695,8 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                         if not header_rewritten and m:
                             hashes = m.group(1)
                             title = m.group(2).strip()
-                            rewritten.append(f"{hashes} [{title}]({online_url})")
+                            # New format: ## Title [↗](url) instead of ## [Title](url)
+                            rewritten.append(f"{hashes} {title} [↗]({online_url})")
                             header_rewritten = True
                         else:
                             rewritten.append(line)
@@ -713,6 +723,65 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
     except Exception as e:
         logger.error(f"Error generating concatenated Markdown file: {e}\n{traceback.format_exc()}")
         return None
+
+def fix_cross_references(concatenated_md_path, online_base_url=None, online_site_dir=None, subfolder_name=None):
+    """
+    Fixes cross-reference links to external documents (e.g., ../../Shared_Admin/..., ../../Actions/...).
+    Converts them to online documentation URLs.
+    """
+    try:
+        if not os.path.exists(concatenated_md_path):
+            logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
+            return
+        
+        if not online_base_url or not online_site_dir:
+            logger.info("No online URL provided, skipping cross-reference conversion")
+            return
+        
+        with open(concatenated_md_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Pattern to match cross-reference links: ../../Something/path/file.htm or .md
+        # Examples: ../../Shared_Admin/_ADM_Config.htm, ../../Actions/Query/_IDOL_QUERY.htm
+        cross_ref_pattern = re.compile(r'\[([^\]]+)\]\((\.\./\.\./[^)]+\.(htm|md)(?:#[^)]*)?)\)')
+        
+        def replace_cross_ref(match):
+            link_text = match.group(1)
+            rel_path = match.group(2)
+            
+            # Parse the path
+            # Example: ../../Shared_Admin/_ADM_Config.htm#Section
+            path_parts = rel_path.split('#')
+            file_path = path_parts[0]
+            anchor = f'#{path_parts[1]}' if len(path_parts) > 1 else ''
+            
+            # Remove leading ../../ and convert to proper path
+            clean_path = file_path.replace('../', '').replace('.md', '.htm')
+            
+            # Determine subfolder for URL
+            if subfolder_name:
+                subfolder = subfolder_name.split('/')[-1] if '/' in subfolder_name else subfolder_name
+                # Build online URL
+                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{clean_path}{anchor}"
+            else:
+                # Fallback to Help path
+                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{clean_path}{anchor}"
+            
+            return f'[{link_text}]({online_url})'
+        
+        # Replace all cross-references
+        updated_content = cross_ref_pattern.sub(replace_cross_ref, content)
+        
+        # Count how many were replaced
+        num_replaced = len(cross_ref_pattern.findall(content))
+        if num_replaced > 0:
+            logger.info(f"Converted {num_replaced} cross-reference links to external URLs")
+        
+        with open(concatenated_md_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+    
+    except Exception as e:
+        logger.error(f"Error fixing cross-references in {concatenated_md_path}: {e}\n{traceback.format_exc()}")
 
 def update_internal_links(concatenated_md_path):
     """
@@ -1087,14 +1156,20 @@ def generate_markdown_anchor(title):
 def clean_markdown_content(content):
     """
     Post-processes markdown content to remove unwanted elements:
-    1. Removes all BEGIN_FILE HTML comments (debugging markers)
-    2. Removes anchor tags immediately before headers
+    1. Removes ONLY the first BEGIN_FILE comment (at top of file)
+    2. Keeps all anchor tags for navigation
     3. Removes search/navigation artifacts at the end
-    4. Removes unwanted navigation elements (Previous/Next links)
-    5. Removes embedded JavaScript code blocks
+    4. Removes orphaned navigation links (Previous/Next)
+    5. DOES NOT remove BEGIN_FILE comments or anchors in the middle of content
     """
     
-    # Pattern 1: Remove sections starting with blacklisted files that appear near the end
+    # Pattern 1: Remove ONLY the very first BEGIN_FILE comment at the start of the file
+    # This is typically at the top and not needed, but keep all others for reference
+    first_begin_file = re.compile(r'^<!--\s*BEGIN_FILE:.*?-->\s*\n', re.MULTILINE)
+    # Only replace the first occurrence
+    content = first_begin_file.sub('', content, count=1)
+    
+    # Pattern 2: Remove sections starting with blacklisted files that appear near the end
     # Look for _FT_SideNav_Startup specifically (the most common footer marker)
     sidenav_footer = re.compile(
         r'<!--\s*BEGIN_FILE:\s*[^>]*?[/\\]_FT_SideNav_Startup\.md\s*-->\s*\n'
@@ -1111,7 +1186,7 @@ def clean_markdown_content(content):
         if last_match.start() >= threshold:
             content = content[:last_match.start()]
     
-    # Pattern 2: Remove footer sections with index.md or index_CSH.md near the end
+    # Pattern 3: Remove footer sections with index.md or index_CSH.md near the end
     index_footer = re.compile(
         r'<!--\s*BEGIN_FILE:\s*[^>]*?[/\\]index(?:_CSH)?\.md\s*-->\s*\n'
         r'.*$',
@@ -1124,7 +1199,7 @@ def clean_markdown_content(content):
         if last_match.start() >= threshold:
             content = content[:last_match.start()]
     
-    # Pattern 3: Remove index_CSH sections with JavaScript (can appear anywhere)
+    # Pattern 4: Remove index_CSH sections with JavaScript (can appear anywhere)
     js_csh_pattern = re.compile(
         r'<!--\s*BEGIN_FILE:.*?index_CSH\.md\s*-->\s*\n'
         r'<a\s+id=["\'].*?["\'].*?>\s*</a>\s*\n'
@@ -1134,29 +1209,7 @@ def clean_markdown_content(content):
     )
     content = js_csh_pattern.sub('', content)
     
-    # Pattern 4: Remove ALL BEGIN_FILE comments throughout the document
-    # These are debugging markers that editors don't recognize as markdown
-    begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:.*?-->\s*\n', re.MULTILINE)
-    content = begin_file_pattern.sub('', content)
-    
-    # Pattern 5: Remove anchor tags that immediately precede headers
-    # This cleans up <a id="..."></a> tags that appear right before # headers
-    anchor_before_header = re.compile(
-        r'<a\s+id=["\']([^"\']+)["\'](?:\s+[^>]*)?>(?:</a>)?\s*\n'
-        r'(#+\s+)',
-        re.MULTILINE
-    )
-    content = anchor_before_header.sub(r'\2', content)
-    
-    # Pattern 5b: Remove standalone anchor tags (not followed by headers)
-    # These can appear at the start of files or standalone in content
-    standalone_anchor = re.compile(
-        r'<a\s+id=["\']([^"\']+)["\'](?:\s+[^>]*)?>(?:</a>)?\s*\n',
-        re.MULTILINE
-    )
-    content = standalone_anchor.sub('', content)
-    
-    # Pattern 6: Remove footer artifacts that include search results and navigation
+    # Pattern 5: Remove footer artifacts that include search results and navigation
     footer_pattern = re.compile(
         r'\n---\s*\n'                                   # Starting horizontal rule
         r'#\s+Your search for.*?returned result.*?\n'  # Search results header
@@ -1167,7 +1220,7 @@ def clean_markdown_content(content):
     )
     content = footer_pattern.sub('', content)
     
-    # Pattern 7: Remove standalone search/navigation sections
+    # Pattern 6: Remove standalone search/navigation sections
     search_nav_pattern = re.compile(
         r'---\s*\n'
         r'#\s+Your search for.*?returned result.*?\n'
@@ -1177,7 +1230,7 @@ def clean_markdown_content(content):
     )
     content = search_nav_pattern.sub('', content)
     
-    # Pattern 7b: Remove "Your search for" headers at the end (without --- prefix)
+    # Pattern 7: Remove "Your search for" headers at the end (without --- prefix)
     search_header_pattern = re.compile(
         r'\n#\s+Your search for.*?returned result.*?\s*$',
         re.MULTILINE | re.DOTALL
@@ -1203,7 +1256,7 @@ def main():
     parser = argparse.ArgumentParser(description='Process folders to copy images and convert HTML to Markdown.')
     parser.add_argument('input_folder', help='The input folder path.')
     parser.add_argument('--max_workers', type=int, default=10, help='Maximum number of worker threads per base folder.')
-    parser.add_argument('--image_extensions', nargs='+', default=['.jpg', '.jpeg', '.png', '.gif', '.bmp'],
+    parser.add_argument('--image_extensions', nargs='+', default=['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg'],
                         help='List of image file extensions to include.')
     parser.add_argument('--online_base_url', type=str, default=None,
                         help='Base URL of the online documentation site (e.g., https://www.microfocus.com/documentation/idol/knowledge-discovery-25.4)')

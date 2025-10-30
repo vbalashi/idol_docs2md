@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument(
         "--image_extensions",
         nargs="+",
-        default=[".jpg", ".jpeg", ".png", ".gif", ".bmp"],
+        default=[".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg"],
         help="Image file extensions to include",
     )
     parser.add_argument(
@@ -312,11 +312,15 @@ def main():
 
     # Step 3: Convert
     print_section(format_bold("CONVERT"))
+    all_md_contents = []  # Collect all markdown contents to merge
+    target_assets_dir = output_md_dir / f"{site_dir}_assets"
+    
     for base in base_folders:
         base_name = base.name if base.name != "Help" else f"{base.parent.name}/Help"
         print(f"📄 Processing: {base_name}")
         
         convert_start = time.time()
+        # Pass the subfolder name for correct URL generation
         process_base_folder(
             str(base),
             args.image_extensions,
@@ -324,31 +328,47 @@ def main():
             online_base_url=base_url,
             online_site_dir=site_dir,
             assets_dirname=f"{site_dir}_assets",
+            subfolder_name=base_name,  # Pass subfolder for URL path
         )
         convert_time = time.time() - convert_start
 
-        # Locate concatenated MD and move/rename to output dir as <site_dir>.md
+        # Locate concatenated MD and collect content
         md_dir = Path(base) / 'md'
         concat_candidates = sorted(md_dir.glob("__*.md"))
         if not concat_candidates:
             print(f"  ✗ No concatenated MD found")
             continue
+        
         concatenated_md = concat_candidates[0]
-        final_md_path = output_md_dir / f"{site_dir}.md"
-        shutil.copy2(concatenated_md, final_md_path)
+        with open(concatenated_md, 'r', encoding='utf-8') as f:
+            content = f.read()
+            # Add a separator between guides
+            if all_md_contents:
+                all_md_contents.append(f"\n\n---\n\n# {base_name} Guide\n\n")
+            all_md_contents.append(content)
 
-        # Move/copy assets directory to output dir with the same name
+        # Merge assets from all subfolders
         assets_dir = md_dir / f"{site_dir}_assets"
         if assets_dir.is_dir():
-            target_assets_dir = output_md_dir / assets_dir.name
-            if target_assets_dir.exists():
-                shutil.rmtree(target_assets_dir)
-            shutil.copytree(assets_dir, target_assets_dir)
+            if not target_assets_dir.exists():
+                target_assets_dir.mkdir(parents=True, exist_ok=True)
+            # Copy assets, handling name conflicts
+            for asset_file in assets_dir.iterdir():
+                if asset_file.is_file():
+                    dest = target_assets_dir / asset_file.name
+                    if not dest.exists():
+                        shutil.copy2(asset_file, dest)
 
         # Verify that assets contain all source images by content; optionally fill missing
         verify_and_fill_assets(md_dir, site_dir, output_md_dir, args.copy_all_images_to_assets)
         
         print(f"  ✓ Converted in {format_time(convert_time)}")
+    
+    # Write the merged markdown file
+    if all_md_contents:
+        final_md_path = output_md_dir / f"{site_dir}.md"
+        with open(final_md_path, 'w', encoding='utf-8') as f:
+            f.write(''.join(all_md_contents))
 
     # Final output
     print_section(format_bold("OUTPUT"))
