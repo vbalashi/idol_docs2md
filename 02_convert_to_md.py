@@ -712,11 +712,15 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                 if online_base_url and online_site_dir:
                     rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
                     
-                    # Try to infer subfolder from file path (for merged documents like IDOLServer)
-                    inferred_subfolder = infer_subfolder_from_path(md_file)
-                    
-                    # Use inferred subfolder if available, otherwise use the provided subfolder_name
-                    effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
+                    # Try to infer subfolder from file path (ONLY for merged documents like IDOLServer)
+                    # For other docs, subfolder inference would incorrectly map standard directories
+                    if 'IDOLServer' in online_site_dir:
+                        inferred_subfolder = infer_subfolder_from_path(md_file)
+                        # Use inferred subfolder if available, otherwise use the provided subfolder_name
+                        effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
+                    else:
+                        # Standard docs: use provided subfolder_name only
+                        effective_subfolder = subfolder_name
                     
                     # Determine correct path based on subfolder
                     if effective_subfolder:
@@ -830,13 +834,31 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
             if is_shared_admin:
                 clean_path = f'Content/{clean_path}'
             
+            # Special handling for ENCODINGS paths - ensure they have proper Content/Actions/ prefix
+            # Patterns we might encounter:
+            # - ENCODINGS/_IDOL_ENCODINGS.htm → Content/Actions/ENCODINGS/_IDOL_ENCODINGS.htm
+            # - Actions/ENCODINGS/_IDOL_ENCODINGS.htm → Content/Actions/ENCODINGS/_IDOL_ENCODINGS.htm
+            if 'ENCODINGS/_IDOL_ENCODINGS.htm' in clean_path:
+                if clean_path.startswith('ENCODINGS/'):
+                    # Missing both Content/ and Actions/
+                    clean_path = f'Content/Actions/{clean_path}'
+                elif clean_path.startswith('Actions/ENCODINGS/'):
+                    # Missing Content/
+                    clean_path = f'Content/{clean_path}'
+                # else: already has proper prefix (Content/Actions/ENCODINGS/)
+            
             # Try to infer subfolder from the cross-reference path
-            # For Shared_Admin, use the context subfolder instead of inferring
+            # ONLY for IDOLServer merged documents - standard docs don't use subfolders
             if is_shared_admin:
-                effective_subfolder = get_context_subfolder(link_position)
-            else:
+                # For Shared_Admin, use the context subfolder
+                effective_subfolder = get_context_subfolder(link_position) if 'IDOLServer' in online_site_dir else subfolder_name
+            elif 'IDOLServer' in online_site_dir:
+                # For IDOLServer, try to infer subfolder from path
                 inferred_subfolder = infer_subfolder_from_path(clean_path)
                 effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
+            else:
+                # Standard docs: use provided subfolder_name only
+                effective_subfolder = subfolder_name
             
             # Determine subfolder for URL
             if effective_subfolder:
