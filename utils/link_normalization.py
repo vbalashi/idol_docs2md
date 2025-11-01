@@ -72,6 +72,23 @@ def normalize_target_path(path: str, family: str, idol_subfolder: Optional[str] 
     return path
 
 
+def _normalize_online_subfolder(site_dir: Optional[str], subfolder: Optional[str]) -> str:
+    """Normalize a subfolder hint to the portion expected in the published URL."""
+    if not subfolder:
+        return ''
+    sub = subfolder.replace('\\', '/').strip('/')
+    if not sub:
+        return ''
+    site = (site_dir or '').strip('/')
+    if site and sub.startswith(site):
+        sub = sub[len(site):].lstrip('/')
+    if sub.lower() == 'help':
+        return 'Help'
+    if sub.lower().endswith('/help'):
+        return 'Help'
+    return sub
+
+
 def build_online_url(base_url: str,
                      site_dir: str,
                      path: str,
@@ -80,13 +97,22 @@ def build_online_url(base_url: str,
                      subfolder: Optional[str] = None) -> str:
     """Build final online URL for the given normalized path and doc family."""
     fam = family or detect_doc_family_from_site_dir(site_dir)
+    path = path.lstrip('/')
+    sub = _normalize_online_subfolder(site_dir, subfolder)
+
+    if 'Content/Shared_Admin/' in path:
+        license_site = re.sub(r'IDOLServer', 'LicenseServer', site_dir, flags=re.IGNORECASE)
+        target_site = license_site or site_dir
+        return f"{base_url.rstrip('/')}/{target_site.strip('/')}/Help/{path}{anchor}"
+
     if fam == 'idolserver':
-        sub = (subfolder or '').split('/')[-1] if subfolder else ''
-        if sub:
-            return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Guides/html/{sub}/{path}{anchor}"
+        sub_idol = sub.split('/')[-1] if sub else ''
+        if sub_idol:
+            return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Guides/html/{sub_idol}/{path}{anchor}"
         # Fallback without subfolder (should be rare)
         return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Guides/html/{path}{anchor}"
     # standard
+    if sub and sub.lower() != 'help':
+        return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/{sub}/{path}{anchor}"
     return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Help/{path}{anchor}"
-
 

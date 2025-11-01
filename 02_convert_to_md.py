@@ -18,9 +18,13 @@ from utils.link_normalization import (
     build_online_url,
 )
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
+# Set up logging for the converter module.
+# Avoid propagating to the root logger so console output stays quiet unless explicitly enabled.
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 # Blacklist patterns for files that should be excluded from concatenation
 # These files typically contain navigation elements, search forms, or other non-content pages
@@ -170,6 +174,8 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
                 update_internal_links(concatenated_md_path)
                 # Fix cross-references to external documents
                 fix_cross_references(concatenated_md_path, online_base_url, online_site_dir, subfolder_name)
+                # Re-run link normalization to clean up any fragments reintroduced by cross-reference handling
+                update_internal_links(concatenated_md_path)
                 # Validate anchors used vs available
                 validate_internal_anchors(concatenated_md_path)
                 # Centralize assets into md/assets and rewrite references
@@ -185,6 +191,9 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
                         f.write(cleaned_content)
                     
                     logger.info(f"Cleaned unwanted elements from concatenated file")
+                    if dedupe_global_anchors(concatenated_md_path):
+                        update_internal_links(concatenated_md_path)
+                        validate_internal_anchors(concatenated_md_path)
                 except Exception as clean_error:
                     logger.warning(f"Error during post-processing cleanup: {clean_error}")
         else:
@@ -225,8 +234,10 @@ def extract_main_content(soup):
     return main_content
 
 def hoist_named_anchors(root):
-    """Move <a name|id="..."></a> out of heading tags and insert as standalone anchors before the heading.
-    This helps preserve anchors through markdown conversion.
+    """Move <a name|id="..."></a> out of heading tags and insert a single standalone anchor before the heading.
+    Preference order:
+        1. First non-kanchor anchor appearing in the heading.
+        2. Generated slug from the heading text when no friendly anchor exists.
     """
     if root is None:
         return
@@ -234,23 +245,63 @@ def hoist_named_anchors(root):
         headings = root.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
     except Exception:
         return
+
+    slug_counts = {}
+    used_ids = set()
+
+    def next_slug(text):
+        base = generate_markdown_anchor(text) if text else ''
+        if not base:
+            base = 'section'
+        count = slug_counts.get(base, 0)
+        candidate = base if count == 0 else f"{base}-{count}"
+        slug_counts[base] = count + 1
+        while candidate in used_ids:
+            count = slug_counts.get(base, 0)
+            candidate = f"{base}-{count}"
+            slug_counts[base] = count + 1
+        return candidate
+
     for h in headings:
         try:
             anchors = h.find_all('a')
         except Exception:
             anchors = []
+        if not anchors:
+            continue
+
+        heading_text = h.get_text(separator=' ', strip=True)
+        candidate_ids = []
         for a in anchors:
             name_or_id = a.get('name') or a.get('id')
-            if not name_or_id:
-                continue
-            # Create a standalone anchor before the heading
-            new_a = root.new_tag('a')
-            new_a['id'] = name_or_id
-            h.insert_before(new_a)
-            # If the anchor is empty, remove it from inside the header
+            if name_or_id:
+                candidate_ids.append(name_or_id)
+
+        # Determine preferred anchor id
+        preferred = None
+        for aid in candidate_ids:
+            if not re.match(r'^kanchor\d+$', aid, re.IGNORECASE):
+                preferred = aid
+                break
+        if preferred and preferred in used_ids:
+            preferred = None
+
+        if not preferred:
+            preferred = next_slug(heading_text)
+
+        # Insert the chosen anchor before the heading
+        new_a = root.new_tag('a')
+        new_a['id'] = preferred
+        h.insert_before(new_a)
+        used_ids.add(preferred)
+
+        # Remove legacy anchors from inside the heading to keep the header clean
+        for a in anchors:
             try:
                 if (not a.text or not a.text.strip()) and len(a.contents) == 0:
                     a.decompose()
+                else:
+                    a.unwrap()
             except Exception:
                 pass
 
@@ -901,6 +952,9 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
             path_parts = rel_path_href.split('#')
             file_path = path_parts[0]
             anchor = f'#{path_parts[1]}' if len(path_parts) > 1 else ''
+
+            if anchor:
+                anchor = f'#{normalize_fragment_value(anchor[1:])}'
             
             # External conversion only when we have an online URL context
             if skip_external:
@@ -917,7 +971,7 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
                 online_base_url,
                 online_site_dir,
                 norm_path,
-                anchor or anchor2,
+                anchor or (f"#{normalize_fragment_value(anchor2[1:])}" if anchor2 else ''),
                 fam,
                 eff_sub,
             )
@@ -931,6 +985,95 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
     
     except Exception as e:
         logger.error(f"Error fixing cross-references in {concatenated_md_path}: {e}\n{traceback.format_exc()}")
+
+def normalize_fragment_value(fragment: str) -> str:
+    """
+    Normalizes malformed anchor fragments generated during conversion.
+    Removes placeholder patterns like a-idkanchor###a..., strips leading kanchor identifiers,
+    and trims redundant leading 'a' characters introduced by anchor collapsing.
+    """
+    if fragment is None:
+        return fragment
+
+    s = fragment
+    changed = False
+
+    # Remove repeated a-idkanchor###a sequences anywhere in the fragment
+    new_s = re.sub(r'a-idkanchor\d+a', '', s, flags=re.IGNORECASE)
+    if new_s != s:
+        changed = True
+        s = new_s
+
+    # Remove leading a-id prefix
+    new_s = re.sub(r'^a-id', '', s, flags=re.IGNORECASE)
+    if new_s != s:
+        changed = True
+        s = new_s
+
+    # Remove leading kanchor### pattern
+    new_s = re.sub(r'^kanchor\d+', '', s, flags=re.IGNORECASE)
+    if new_s != s:
+        changed = True
+        s = new_s
+
+    s = s.strip()
+    return s or fragment
+
+def dedupe_global_anchors(concatenated_md_path):
+    """
+    Ensures anchor ids in the concatenated markdown file are globally unique.
+    Subsequent duplicate anchors are suffixed with -2, -3, ... and stray kanchor anchors are removed.
+    """
+    if not os.path.exists(concatenated_md_path):
+        return False
+    try:
+        with open(concatenated_md_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        anchor_re = re.compile(r'<a\s+id="([^"]+)"\s*>\s*</a>', re.IGNORECASE)
+        used_ids = set()
+        pieces = []
+        replacements = []
+        last = 0
+
+        for match in anchor_re.finditer(content):
+            start, end = match.span()
+            aid = match.group(1)
+            new_tag = None
+
+            if re.match(r'^kanchor\d+$', aid, re.IGNORECASE):
+                new_tag = ''
+            elif aid in used_ids:
+                suffix = 2
+                while True:
+                    candidate = f"{aid}-{suffix}"
+                    if candidate not in used_ids:
+                        break
+                    suffix += 1
+                used_ids.add(candidate)
+                replacements.append((aid, candidate))
+                new_tag = f'<a id="{candidate}"></a>'
+            else:
+                used_ids.add(aid)
+
+            if new_tag is not None:
+                pieces.append(content[last:start])
+                pieces.append(new_tag)
+                last = end
+
+        if not pieces:
+            return False
+
+        pieces.append(content[last:])
+        updated_content = ''.join(pieces)
+
+        with open(concatenated_md_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+
+        return True
+    except Exception as e:
+        logger.error(f"Error deduplicating anchors in {concatenated_md_path}: {e}\n{traceback.format_exc()}")
+        return False
 
 def update_internal_links(concatenated_md_path):
     """
@@ -963,10 +1106,8 @@ def update_internal_links(concatenated_md_path):
         # Example: ](#a-idkanchor96adih-distribution-mode-features) -> ](#dih-distribution-mode-features)
         def strip_ai_kanchor_fragment(m):
             tail = m.group(1)
-            # If tail starts with 'a' (from '<a>'), drop it once
-            if tail.startswith('a'):
-                tail = tail[1:]
-            return f'](#{tail})'
+            tail_norm = normalize_fragment_value(tail)
+            return f'](#{tail_norm})'
         content = re.sub(r'\]\(#a-idkanchor\d+a([^)#\s]+)\)', strip_ai_kanchor_fragment, content, flags=re.IGNORECASE)
 
         # We now rewrite links in a context-aware manner: for each block beginning with
@@ -1089,22 +1230,7 @@ def update_internal_links(concatenated_md_path):
                 # If we have a fragment, normalize to an actual heading anchor id
                 if frag:
                     ref = frag[1:]
-                    # Normalize malformed fragments (e.g., a-idkanchor12a...)
-                    def normalize_fragment(r: str) -> str:
-                        s0 = r
-                        changed = False
-                        s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
-                        if s != s0:
-                            changed = True
-                            s0 = s
-                        s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
-                        if s != s0:
-                            changed = True
-                            s0 = s
-                        if changed and s0.startswith('a'):
-                            s0 = s0[1:]
-                        return s0
-                    ref_norm = normalize_fragment(ref)
+                    ref_norm = normalize_fragment_value(ref)
                     base = anchor_base(generate_markdown_anchor(ref_norm))
                     candidates = anchors_by_base.get(base, [])
                     if candidates:
@@ -1136,22 +1262,7 @@ def update_internal_links(concatenated_md_path):
                 link_text = m.group(1)
                 ref = m.group(2)
                 # Normalize malformed fragments (e.g., a-idkanchor12aadvanced-distribution-modes)
-                def normalize_fragment(r: str) -> str:
-                    s0 = r
-                    changed = False
-                    s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
-                    if s != s0:
-                        changed = True
-                        s0 = s
-                    s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
-                    if s != s0:
-                        changed = True
-                        s0 = s
-                    # Drop leftover leading 'a' only if we previously changed something
-                    if changed and s0.startswith('a'):
-                        s0 = s0[1:]
-                    return s0
-                ref_norm = normalize_fragment(ref)
+                ref_norm = normalize_fragment_value(ref)
                 # If already a valid anchor id, rewrite to the normalized id
                 if ref_norm in available_anchor_ids:
                     return f'[{link_text}](#{ref_norm})'
@@ -1245,21 +1356,7 @@ def update_internal_links(concatenated_md_path):
             # If a fragment exists, normalize and resolve via anchors_by_base
             if frag:
                 ref = frag[1:]
-                def normalize_fragment(r: str) -> str:
-                    s0 = r
-                    changed = False
-                    s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
-                    if s != s0:
-                        changed = True
-                        s0 = s
-                    s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
-                    if s != s0:
-                        changed = True
-                        s0 = s
-                    if changed and s0.startswith('a'):
-                        s0 = s0[1:]
-                    return s0
-                ref_norm = normalize_fragment(ref)
+                ref_norm = normalize_fragment_value(ref)
                 base = anchor_base(generate_markdown_anchor(ref_norm))
                 candidates = anchors_by_base.get(base, [])
                 if candidates:
@@ -1274,21 +1371,7 @@ def update_internal_links(concatenated_md_path):
             link_text = m.group(1)
             ref = m.group(2)
             # Normalize malformed fragments globally
-            def normalize_fragment(r: str) -> str:
-                s0 = r
-                changed = False
-                s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
-                if s != s0:
-                    changed = True
-                    s0 = s
-                s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
-                if s != s0:
-                    changed = True
-                    s0 = s
-                if changed and s0.startswith('a'):
-                    s0 = s0[1:]
-                return s0
-            ref_norm = normalize_fragment(ref)
+            ref_norm = normalize_fragment_value(ref)
             if ref_norm in available_anchor_ids:
                 return f'[{link_text}](#{ref_norm})'
             base = anchor_base(generate_markdown_anchor(ref_norm))
@@ -1465,7 +1548,52 @@ def clean_markdown_content(content):
     # Step A: Remove obviously malformed anchors produced by bad placeholder merges
     content = re.sub(r'^\s*<a\s+id="a-id[^"]*"\s*>\s*</a>\s*\n?', '', content, flags=re.MULTILINE)
 
+    # Step A2: Normalize anchor ids that still contain legacy fragments and deduplicate consecutive copies
+    anchor_tag_re = re.compile(r'<a\s+id="([^"]+)"\s*>\s*</a>', re.IGNORECASE)
+
+    def normalize_anchor_tag(m):
+        original = m.group(1)
+        if re.match(r'^kanchor\d+$', original, re.IGNORECASE):
+            return ''
+        normalized = normalize_fragment_value(original)
+        if not normalized:
+            return ''
+        if normalized != original:
+            return f'<a id="{normalized}"></a>'
+        return m.group(0)
+
+    content = anchor_tag_re.sub(normalize_anchor_tag, content)
+
+    def dedupe_anchor_block(m):
+        block = m.group(0)
+        ids = []
+        for aid in anchor_tag_re.findall(block):
+            if aid not in ids:
+                ids.append(aid)
+        if not ids:
+            return ''
+        return ''.join(f'<a id="{aid}"></a>\n' for aid in ids)
+
+    content = re.sub(r'((?:<a\s+id="[^"]+"\s*>\s*</a>\s*\n)+)', dedupe_anchor_block, content, flags=re.IGNORECASE)
+
     # Step B: For headers that contain inline anchors, hoist a single preferred anchor above the header
+    slug_counts = {}
+    used_header_ids = set()
+
+    def next_slug(text):
+        base = generate_markdown_anchor(text) if text else ''
+        if not base:
+            base = 'section'
+        count = slug_counts.get(base, 0)
+        candidate = base if count == 0 else f"{base}-{count}"
+        slug_counts[base] = count + 1
+        while candidate in used_header_ids:
+            count = slug_counts.get(base, 0)
+            candidate = f"{base}-{count}"
+            slug_counts[base] = count + 1
+        used_header_ids.add(candidate)
+        return candidate
+
     header_line_re = re.compile(r'^(?P<hashes>#{1,6})\s+(?P<body>.*)$', re.MULTILINE)
     inline_anchor_re = re.compile(r'<a\s+id="([^"]+)"\s*>\s*</a>', re.IGNORECASE)
 
@@ -1482,13 +1610,23 @@ def clean_markdown_content(content):
                 preferred = a
                 break
         if preferred is None:
-            preferred = anchors[0]
+            clean_text = inline_anchor_re.sub('', body).strip()
+            preferred = next_slug(clean_text)
+        else:
+            if preferred in used_header_ids:
+                clean_text = inline_anchor_re.sub('', body).strip()
+                preferred = next_slug(clean_text)
+            else:
+                used_header_ids.add(preferred)
         # Remove all inline anchors from the header text
         clean_text = inline_anchor_re.sub('', body).strip()
         # Emit anchor on its own line, then clean header
         return f'<a id="{preferred}"></a>\n{hashes} {clean_text}'
 
     content = header_line_re.sub(rewrite_header, content)
+
+    # Dedupe anchors again in case header rewriting introduced duplicates
+    content = re.sub(r'((?:<a\s+id="[^"]+"\s*>\s*</a>\s*\n)+)', dedupe_anchor_block, content, flags=re.IGNORECASE)
 
     # Pattern 1: Remove ONLY the very first BEGIN_FILE comment at the start of the file
     # This is typically at the top and not needed, but keep all others for reference

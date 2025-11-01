@@ -128,12 +128,14 @@ def scan_documentation_site(start_url: str) -> List[DocItem]:
         for name, url in zip_links:
             items.append(DocItem(name, url, ""))
     
-    # Remove duplicates based on ZIP URL
-    seen = set()
-    unique_items = []
+    # Remove exact duplicates only (same name AND same ZIP URL)
+    # Keep rows that share a ZIP but represent different guides (e.g., C, C++, Java)
+    seen: set = set()
+    unique_items: List[DocItem] = []
     for item in items:
-        if item.zip_url not in seen:
-            seen.add(item.zip_url)
+        key = (item.name, item.zip_url)
+        if key not in seen:
+            seen.add(key)
             unique_items.append(item)
     
     print(f"✓ Found {len(unique_items)} documentation items")
@@ -342,9 +344,12 @@ def run_conversion(zip_url: str, args: argparse.Namespace) -> bool:
     
     if args.force:
         cmd.append("--force")
-    
+
     if args.copy_all_images_to_assets:
         cmd.append("--copy_all_images_to_assets")
+
+    if not getattr(args, "show_warnings", False):
+        cmd.append("--quiet-warnings")
     
     try:
         result = subprocess.run(cmd, check=True)
@@ -402,6 +407,11 @@ def main():
         help="Copy all source images to assets, even if not referenced in MD",
     )
     parser.add_argument(
+        "--show-warnings",
+        action="store_true",
+        help="Display detailed warnings from conversion runs (default suppresses known chatter)",
+    )
+    parser.add_argument(
         "--no-tui",
         action="store_true",
         help="Skip TUI and process all found items automatically",
@@ -457,12 +467,20 @@ def main():
     
     success_count = 0
     failed_items = []
+    processed_zip_urls: set = set()
     
     for i, item in enumerate(selected_items, 1):
         print(f"\n[{i}/{len(selected_items)}] {item.name}")
         print("-" * 70)
         
-        success = run_conversion(item.zip_url, args)
+        # Avoid reprocessing the same ZIP multiple times if multiple guides share it
+        if item.zip_url in processed_zip_urls:
+            print(f"↺ Skipping duplicate ZIP already processed: {item.zip_url}")
+            success = True
+        else:
+            success = run_conversion(item.zip_url, args)
+            if success:
+                processed_zip_urls.add(item.zip_url)
         
         if success:
             success_count += 1
@@ -491,4 +509,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

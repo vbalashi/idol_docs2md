@@ -16,6 +16,7 @@ mfdocs/
 
 # Generated output
 md/
+archive/
 *.epub
 *.pdf
 *.html

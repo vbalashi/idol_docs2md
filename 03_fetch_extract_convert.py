@@ -30,13 +30,34 @@ logging.root.handlers.clear()
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.WARNING)
 console_handler.setFormatter(logging.Formatter('%(levelname)s:%(message)s'))
-logging.getLogger().addHandler(console_handler)
-logging.getLogger().setLevel(logging.WARNING)
+root_logger = logging.getLogger()
+root_logger.addHandler(console_handler)
+root_logger.setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 try:
     # Ensure converter logger does not propagate to root console
     _converter.logger.propagate = False
 except Exception:
     pass
+
+
+def _get_converter_logger():
+    return getattr(_converter, "logger", logging.getLogger(_spec.name or "converter02"))
+
+
+def _configure_converter_console_logging(level):
+    converter_logger = _get_converter_logger()
+    # Drop any console handlers we previously added to avoid duplicates
+    for handler in list(converter_logger.handlers):
+        if getattr(handler, "_converter_console", False):
+            converter_logger.removeHandler(handler)
+    if level is not None:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter('%(levelname)s:%(message)s'))
+        handler._converter_console = True  # Mark for future cleanup
+        converter_logger.addHandler(handler)
+    return converter_logger
 
 
 def parse_args():
@@ -83,6 +104,11 @@ def parse_args():
         "--copy_all_images_to_assets",
         action="store_true",
         help="If assets miss some source images, copy the remaining ones into the assets folder.",
+    )
+    parser.add_argument(
+        "--quiet-warnings",
+        action="store_true",
+        help="Suppress verbose warning output on the console for cleaner runs.",
     )
     return parser.parse_args()
 
@@ -268,8 +294,16 @@ def verify_and_fill_assets(md_dir: Path, site_dir: str, output_md_dir: Path, cop
     print(f"  Images: {len(asset_images)} included, "
           f"{len(source_images)} total")
     if missing_hashes:
-        print(f"  ⚠ {len(missing_hashes)} unreferenced images "
-              f"(not linked in MD)")
+        count_missing = len(missing_hashes)
+        if copy_missing:
+            logger.warning(
+                f"  ⚠ {count_missing} unreferenced images detected; copying to assets"
+            )
+        else:
+            logger.warning(
+                f"  ⚠ {count_missing} unreferenced images (not linked in MD). "
+                "Use --copy_all_images_to_assets to include them"
+            )
         if copy_missing:
             # Copy the first representative of each missing hash
             for h in missing_hashes:
@@ -285,14 +319,21 @@ def verify_and_fill_assets(md_dir: Path, site_dir: str, output_md_dir: Path, cop
                 except Exception:
                     pass
             print(f"  ✓ Copied missing images to assets")
-        else:
-            print(f"  Tip: Use --copy_all_images_to_assets "
-                  f"to include them")
 
 
 def main():
     start_time = time.time()
     args = parse_args()
+
+    converter_logger = _configure_converter_console_logging(
+        None if args.quiet_warnings else logging.WARNING
+    )
+    converter_logger.setLevel(logging.INFO)
+
+    if args.quiet_warnings:
+        console_handler.setLevel(logging.ERROR)
+    else:
+        console_handler.setLevel(logging.WARNING)
 
     base_url, site_dir = derive_base_and_site(args.zip_url)
 
@@ -320,8 +361,16 @@ def main():
     target_assets_dir = output_md_dir / f"{site_dir}_assets"
     
     for base in base_folders:
-        base_name = base.name if base.name != "Help" else f"{base.parent.name}/Help"
-        print(f"📄 Processing: {base_name}")
+        try:
+            rel = base.relative_to(extracted_root)
+            base_name = rel.as_posix()
+        except ValueError:
+            base_name = base.name
+
+        if base_name == '.':
+            base_name = ''
+
+        print(f"📄 Processing: {base_name or base.name}")
         
         convert_start = time.time()
         # Pass the subfolder name for correct URL generation
@@ -373,6 +422,12 @@ def main():
         final_md_path = output_md_dir / f"{site_dir}.md"
         with open(final_md_path, 'w', encoding='utf-8') as f:
             f.write(''.join(all_md_contents))
+        try:
+            if _converter.dedupe_global_anchors(str(final_md_path)):
+                _converter.update_internal_links(str(final_md_path))
+                _converter.validate_internal_anchors(str(final_md_path))
+        except Exception as e:
+            print(f"  ⚠ Anchor dedupe on {final_md_path.name} failed: {e}")
 
     # Final output
     print_section(format_bold("OUTPUT"))
@@ -387,5 +442,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
