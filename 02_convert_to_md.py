@@ -11,6 +11,12 @@ import logging
 import traceback
 from markdownify import markdownify as md
 import hashlib
+from utils.link_normalization import (
+    detect_doc_family_from_site_dir,
+    strip_rel_and_ext,
+    normalize_target_path,
+    build_online_url,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
@@ -49,7 +55,7 @@ def is_blacklisted(filepath):
     # Check for files in Shared_* directories (often contain cover pages/navigation)
     if 'Shared_' in filepath or '/Shared_' in filepath or '\\Shared_' in filepath:
         # Allow some shared content but exclude covers and navigation
-        if basename.startswith('_') or 'Cover' in basename or 'Nav' in basename:
+        if ('Cover' in basename or 'Nav' in basename) and basename.startswith('_'):
             logger.info(f"Blacklisted shared file excluded: {filepath}")
             return True
     
@@ -212,6 +218,62 @@ def copy_image(src, images_dir):
     except Exception as e:
         logger.error(f"Error copying image {src}: {e}")
 
+def extract_main_content(soup):
+    main_content = soup.find('div', {'role': 'main', 'id': 'mc-main-content'})
+    if not main_content:
+        main_content = soup.find('div', {'class': 'main-content'})
+    return main_content
+
+def hoist_named_anchors(root):
+    """Move <a name|id="..."></a> out of heading tags and insert as standalone anchors before the heading.
+    This helps preserve anchors through markdown conversion.
+    """
+    if root is None:
+        return
+    try:
+        headings = root.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+    except Exception:
+        return
+    for h in headings:
+        try:
+            anchors = h.find_all('a')
+        except Exception:
+            anchors = []
+        for a in anchors:
+            name_or_id = a.get('name') or a.get('id')
+            if not name_or_id:
+                continue
+            # Create a standalone anchor before the heading
+            new_a = root.new_tag('a')
+            new_a['id'] = name_or_id
+            h.insert_before(new_a)
+            # If the anchor is empty, remove it from inside the header
+            try:
+                if (not a.text or not a.text.strip()) and len(a.contents) == 0:
+                    a.decompose()
+            except Exception:
+                pass
+
+def sanitize_html(html_content):
+    # Define allowed tags and attributes
+    allowed_tags = [
+        'p', 'br', 'strong', 'em', 'u', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'ol', 'ul', 'li', 'a', 'img', 'blockquote', 'code', 'pre', 'hr', 'div', 'span',
+        'table', 'thead', 'tbody', 'tr', 'th', 'td', 'col', 'colgroup'
+    ]
+    allowed_attributes = {
+        'a': ['href', 'title', 'id', 'name'],
+        'img': ['src', 'alt', 'title'],
+        'div': ['class'],
+        'span': ['class'],
+        'th': ['colspan', 'rowspan'],
+        'td': ['colspan', 'rowspan']
+    }
+
+    # Sanitize the HTML content
+    clean_html = bleach.clean(html_content, tags=allowed_tags, attributes=allowed_attributes, strip=True)
+    return clean_html
+
 def convert_html_to_md(input_file, base_folder, md_dir):
     try:
         with open(input_file, 'r', encoding='utf-8', errors='ignore') as html_file:
@@ -223,6 +285,12 @@ def convert_html_to_md(input_file, base_folder, md_dir):
         if main_content is None:
             logger.warning(f"Warning: Could not extract main content from {input_file}")
             main_content = soup  # Use entire content if main content not found
+
+        # Preserve legacy anchors: hoist <a name>/<a id> out of headings
+        try:
+            hoist_named_anchors(main_content)
+        except Exception:
+            pass
 
         # Sanitize the HTML content using Bleach
         sanitized_content = sanitize_html(str(main_content))
@@ -243,35 +311,28 @@ def convert_html_to_md(input_file, base_folder, md_dir):
     except Exception as e:
         logger.error(f"Error converting {input_file} to Markdown: {e}\n{traceback.format_exc()}")
 
-def extract_main_content(soup):
-    main_content = soup.find('div', {'role': 'main', 'id': 'mc-main-content'})
-    if not main_content:
-        main_content = soup.find('div', {'class': 'main-content'})
-    return main_content
-
-def sanitize_html(html_content):
-    # Define allowed tags and attributes
-    allowed_tags = [
-        'p', 'br', 'strong', 'em', 'u', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-        'ol', 'ul', 'li', 'a', 'img', 'blockquote', 'code', 'pre', 'hr', 'div', 'span',
-        'table', 'thead', 'tbody', 'tr', 'th', 'td', 'col', 'colgroup'
-    ]
-    allowed_attributes = {
-        'a': ['href', 'title'],
-        'img': ['src', 'alt', 'title'],
-        'div': ['class'],
-        'span': ['class'],
-        'th': ['colspan', 'rowspan'],
-        'td': ['colspan', 'rowspan']
-    }
-
-    # Sanitize the HTML content
-    clean_html = bleach.clean(html_content, tags=allowed_tags, attributes=allowed_attributes, strip=True)
-    return clean_html
-
 def convert_to_markdown(html_content, input_file, base_folder, md_dir):
+    # Preserve empty anchor tags by converting them to placeholders pre-conversion
+    def anchor_to_placeholder(match):
+        aid = match.group(1)
+        return f'[[ANCHOR::{aid}]]'
+
+    html_with_placeholders = re.sub(
+        r'<a\s+(?:id|name)=["\']([^"\']+)["\'][^>]*>\s*</a>',
+        anchor_to_placeholder,
+        html_content,
+        flags=re.IGNORECASE
+    )
+
     # Convert HTML to Markdown using markdownify
-    markdown_content = md(html_content, heading_style="ATX")
+    markdown_content = md(html_with_placeholders, heading_style="ATX")
+
+    # Restore placeholders back to HTML anchors
+    def placeholder_to_anchor(match):
+        aid = match.group(1)
+        return f'<a id="{aid}"></a>'
+
+    markdown_content = re.sub(r'\[\[ANCHOR::([^\]]+)\]\]', placeholder_to_anchor, markdown_content)
 
     # Adjust image links
     markdown_content = re.sub(
@@ -310,10 +371,18 @@ def adjust_internal_link(match, input_file, base_folder, md_dir):
     if not href.lower().endswith(('.htm', '.html')):
         return match.group(0)
 
-    # Resolve the target HTML file path
-    target_html_path = os.path.normpath(os.path.join(os.path.dirname(input_file), href))
+    # Resolve the target HTML file path from the base_folder
+    # This correctly handles ../ patterns by resolving from the documentation root
+    href_no_anchor = href.split('#')[0]
+    anchor_suffix = ''
+    if '#' in href:
+        anchor_suffix = '#' + href.split('#', 1)[1]
+    current_dir = os.path.dirname(os.path.relpath(input_file, base_folder))
+    target_rel_path = os.path.normpath(os.path.join(current_dir, href_no_anchor))
+    target_html_path = os.path.join(base_folder, target_rel_path)
+
     if not os.path.isfile(target_html_path):
-        logger.warning(f"Linked HTML file {target_html_path} not found. Leaving the original link.")
+        logger.warning(f"Linked HTML file {target_html_path} not found (from {input_file} with href {href}). Leaving original link.")
         return match.group(0)
 
     # Determine the corresponding Markdown file path
@@ -327,7 +396,7 @@ def adjust_internal_link(match, input_file, base_folder, md_dir):
     # Replace backslashes with forward slashes for Markdown
     relative_path = relative_path.replace('\\', '/')
 
-    return f'[{link_text}]({relative_path})'
+    return f'[{link_text}]({relative_path}{anchor_suffix})'
 
 def get_md_path(html_path, base_folder, md_dir):
     """
@@ -583,7 +652,7 @@ def infer_subfolder_from_path(file_path):
             
             # Mapping based on observed patterns in IDOLServer documentation
             expert_dirs = ['IDOLExpert', 'DocMap', 'Amazon EFS', 'FunctionalityView']
-            documentsecurity_dirs = ['IAS', 'StandardSecurity', 'OmniGroupServer', 'Appendixes', 'GenericSecurity', 'Resources']
+            documentsecurity_dirs = ['IAS', 'StandardSecurity', 'OmniGroupServer', 'Appendixes', 'GenericSecurity', 'Resources', 'MappedSecurity']
             gettingstarted_dirs = ['Install_Run_IDOL', 'IDOL_Systems']
             
             if first_dir in expert_dirs or 'Expert' in first_dir:
@@ -710,34 +779,25 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                     concatenated_file.write(f"<a id=\"{anchor_for_file}\"></a>\n")
                 # If online URL info is provided, rewrite the first header of this block to link to the online source
                 if online_base_url and online_site_dir:
+                    # Derive normalized path from the md_file (per-file context)
+                    fam = detect_doc_family_from_site_dir(online_site_dir)
                     rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
                     
-                    # Try to infer subfolder from file path (ONLY for merged documents like IDOLServer)
-                    # For other docs, subfolder inference would incorrectly map standard directories
-                    if 'IDOLServer' in online_site_dir:
-                        inferred_subfolder = infer_subfolder_from_path(md_file)
-                        # Use inferred subfolder if available, otherwise use the provided subfolder_name
-                        effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
-                    else:
-                        # Standard docs: use provided subfolder_name only
-                        effective_subfolder = subfolder_name
+                    # If the path is in Shared_Admin, it should be prefixed correctly
+                    # to resolve from the root of the documentation content.
+                    if 'Shared_Admin' in rel_html_path:
+                        rel_html_path = re.sub(r'.*?(Shared_Admin)', r'Content/\1', rel_html_path)
                     
-                    # Determine correct path based on subfolder
-                    if effective_subfolder:
-                        # Extract just the subfolder name (e.g., "gettingstarted" from "html/gettingstarted")
-                        subfolder = effective_subfolder.split('/')[-1] if '/' in effective_subfolder else effective_subfolder
-                        
-                        # Special case: IDOLServer has a unique URL structure with /Guides/html/ prefix
-                        if 'IDOLServer' in online_site_dir:
-                            # IDOLServer structure: {base_url}/{doc_name}/Guides/html/{subfolder}/{rel_html_path}
-                            online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{rel_html_path}"
-                        else:
-                            # Standard structure: {base_url}/{doc_name}/{subfolder}/{rel_html_path}
-                            online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{rel_html_path}"
-                    else:
-                        # Without subfolder: {base_url}/{doc_name}/Help/{rel_html_path}
-                        # The "Help" segment is part of the online documentation structure
-                        online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{rel_html_path}"
+                    norm_path = normalize_target_path(rel_html_path, fam, infer_subfolder_from_path(md_file) if fam == 'idolserver' else None)
+                    # Subfolder: only relevant for IDOLServer; infer when available
+                    eff_sub = infer_subfolder_from_path(md_file) if fam == 'idolserver' else subfolder_name
+                    online_url = build_online_url(
+                        online_base_url,
+                        online_site_dir,
+                        norm_path,
+                        family=fam,
+                        subfolder=eff_sub,
+                    )
                     rewritten = []
                     header_rewritten = False
                     for line in content.splitlines():
@@ -777,114 +837,94 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
 def fix_cross_references(concatenated_md_path, online_base_url=None, online_site_dir=None, subfolder_name=None):
     """
     Fixes cross-reference links to external documents (e.g., ../../Shared_Admin/..., ../../Actions/...).
-    Converts them to online documentation URLs.
-    Context-aware: tracks which BEGIN_FILE block we're in to determine the correct subfolder for Shared_Admin links.
+    Converts them to online documentation URLs, but only if the target is not part of the current bundle.
     """
     try:
         if not os.path.exists(concatenated_md_path):
             logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
             return
+        # We can still convert internal cross-refs to anchors even without online URL
+        skip_external = not (online_base_url and online_site_dir)
         
-        if not online_base_url or not online_site_dir:
-            logger.info("No online URL provided, skipping cross-reference conversion")
-            return
-        
+        md_dir = os.path.dirname(concatenated_md_path)
+        anchors_path = os.path.join(md_dir, '__anchors.json')
+        anchors_by_rel = {}
+        if os.path.exists(anchors_path):
+            try:
+                with open(anchors_path, 'r', encoding='utf-8') as af:
+                    anchor_data = json.load(af)
+                    anchors_by_rel = anchor_data.get('by_rel_path', {})
+            except Exception as e:
+                logger.error(f"Failed to read anchor mapping at {anchors_path}: {e}")
+
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Pattern to match cross-reference links: ../../Something/path/file.htm or .md
-        # Examples: ../../Shared_Admin/_ADM_Config.htm, ../../Actions/Query/_IDOL_QUERY.htm
-        cross_ref_pattern = re.compile(r'\[([^\]]+)\]\((\.\./\.\./[^)]+\.(htm|md)(?:#[^)]*)?)\)')
+        cross_ref_pattern = re.compile(r'\[([^\]]+)\]\(((?:\.\./)+[^)]+\.(?:htm|md)(?:#[^)]*)?)\)')
         
-        # Build a map of position -> context_subfolder by finding all BEGIN_FILE markers
         begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:\s*([^\s]+)\s*-->')
-        context_map = []  # List of (position, inferred_subfolder)
-        for match in begin_file_pattern.finditer(content):
-            file_path = match.group(1)
-            context_subfolder = infer_subfolder_from_path(file_path)
-            context_map.append((match.start(), context_subfolder))
+        context_map = [(match.start(), match.group(1)) for match in begin_file_pattern.finditer(content)]
         
-        def get_context_subfolder(pos):
-            """Get the subfolder context for a given position in the document."""
+        def get_context_info(pos):
+            """Get the file path and subfolder context for a given position in the document."""
+            current_file_path = None
             current_subfolder = subfolder_name
-            for start_pos, ctx_subfolder in context_map:
+            for start_pos, file_path in context_map:
                 if start_pos <= pos:
-                    current_subfolder = ctx_subfolder if ctx_subfolder else current_subfolder
+                    current_file_path = file_path
+                    inferred_sub = infer_subfolder_from_path(file_path)
+                    if inferred_sub:
+                        current_subfolder = inferred_sub
                 else:
                     break
-            return current_subfolder
+            return current_file_path, current_subfolder
         
         def replace_cross_ref(match):
             link_text = match.group(1)
-            rel_path = match.group(2)
+            rel_path_href = match.group(2)
             link_position = match.start()
             
-            # Parse the path
-            # Example: ../../Shared_Admin/_ADM_Config.htm#Section
-            path_parts = rel_path.split('#')
+            source_file, context_subfolder = get_context_info(link_position)
+            
+            if source_file:
+                source_dir = os.path.dirname(source_file)
+                target_path_no_anchor = rel_path_href.split('#')[0]
+                
+                resolved_path = os.path.normpath(os.path.join(source_dir, target_path_no_anchor))
+                resolved_path_md = os.path.splitext(resolved_path.replace('\\', '/'))[0] + '.md'
+                
+                if resolved_path_md in anchors_by_rel:
+                    # Convert to an internal anchor link using the target file's anchor id
+                    anchor_id = anchors_by_rel[resolved_path_md]
+                    return f'[{link_text}](#{anchor_id})'
+
+            path_parts = rel_path_href.split('#')
             file_path = path_parts[0]
             anchor = f'#{path_parts[1]}' if len(path_parts) > 1 else ''
             
-            # Remove leading ../../ and convert to proper path
-            clean_path = file_path.replace('../', '').replace('.md', '.htm')
+            # External conversion only when we have an online URL context
+            if skip_external:
+                return match.group(0)
+
+            fam = detect_doc_family_from_site_dir(online_site_dir)
+            clean_path, anchor2 = strip_rel_and_ext(file_path)
             
-            # Special handling for Shared_Admin paths - they should be under Content/
-            # and use the CURRENT document's subfolder (from context), not inferred from Shared_Admin itself
-            is_shared_admin = clean_path.startswith('Shared_Admin/')
-            if is_shared_admin:
-                clean_path = f'Content/{clean_path}'
+            inferred_sub = infer_subfolder_from_path(clean_path) if fam == 'idolserver' else None
+            eff_sub = inferred_sub or (context_subfolder if fam == 'idolserver' else subfolder_name)
+            norm_path = normalize_target_path(clean_path, fam, eff_sub)
             
-            # Special handling for ENCODINGS paths - ensure they have proper Content/Actions/ prefix
-            # Patterns we might encounter:
-            # - ENCODINGS/_IDOL_ENCODINGS.htm → Content/Actions/ENCODINGS/_IDOL_ENCODINGS.htm
-            # - Actions/ENCODINGS/_IDOL_ENCODINGS.htm → Content/Actions/ENCODINGS/_IDOL_ENCODINGS.htm
-            if 'ENCODINGS/_IDOL_ENCODINGS.htm' in clean_path:
-                if clean_path.startswith('ENCODINGS/'):
-                    # Missing both Content/ and Actions/
-                    clean_path = f'Content/Actions/{clean_path}'
-                elif clean_path.startswith('Actions/ENCODINGS/'):
-                    # Missing Content/
-                    clean_path = f'Content/{clean_path}'
-                # else: already has proper prefix (Content/Actions/ENCODINGS/)
-            
-            # Try to infer subfolder from the cross-reference path
-            # ONLY for IDOLServer merged documents - standard docs don't use subfolders
-            if is_shared_admin:
-                # For Shared_Admin, use the context subfolder
-                effective_subfolder = get_context_subfolder(link_position) if 'IDOLServer' in online_site_dir else subfolder_name
-            elif 'IDOLServer' in online_site_dir:
-                # For IDOLServer, try to infer subfolder from path
-                inferred_subfolder = infer_subfolder_from_path(clean_path)
-                effective_subfolder = inferred_subfolder if inferred_subfolder else subfolder_name
-            else:
-                # Standard docs: use provided subfolder_name only
-                effective_subfolder = subfolder_name
-            
-            # Determine subfolder for URL
-            if effective_subfolder:
-                subfolder = effective_subfolder.split('/')[-1] if '/' in effective_subfolder else effective_subfolder
-                
-                # Special case: IDOLServer has a unique URL structure with /Guides/html/ prefix
-                if 'IDOLServer' in online_site_dir:
-                    # IDOLServer structure: {base_url}/{doc_name}/Guides/html/{subfolder}/{clean_path}
-                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Guides/html/{subfolder}/{clean_path}{anchor}"
-                else:
-                    # Standard structure: {base_url}/{doc_name}/{subfolder}/{clean_path}
-                    online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/{subfolder}/{clean_path}{anchor}"
-            else:
-                # Without subfolder: {base_url}/{doc_name}/Help/{clean_path}
-                # The "Help" segment is part of the online documentation structure
-                online_url = f"{online_base_url.rstrip('/')}/{online_site_dir.strip('/')}/Help/{clean_path}{anchor}"
+            online_url = build_online_url(
+                online_base_url,
+                online_site_dir,
+                norm_path,
+                anchor or anchor2,
+                fam,
+                eff_sub,
+            )
             
             return f'[{link_text}]({online_url})'
         
-        # Replace all cross-references
         updated_content = cross_ref_pattern.sub(replace_cross_ref, content)
-        
-        # Count how many were replaced
-        num_replaced = len(cross_ref_pattern.findall(content))
-        if num_replaced > 0:
-            logger.info(f"Converted {num_replaced} cross-reference links to external URLs")
         
         with open(concatenated_md_path, 'w', encoding='utf-8') as f:
             f.write(updated_content)
@@ -919,10 +959,21 @@ def update_internal_links(concatenated_md_path):
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
+        # Pre-normalize malformed fragments embedded in markdown links globally
+        # Example: ](#a-idkanchor96adih-distribution-mode-features) -> ](#dih-distribution-mode-features)
+        def strip_ai_kanchor_fragment(m):
+            tail = m.group(1)
+            # If tail starts with 'a' (from '<a>'), drop it once
+            if tail.startswith('a'):
+                tail = tail[1:]
+            return f'](#{tail})'
+        content = re.sub(r'\]\(#a-idkanchor\d+a([^)#\s]+)\)', strip_ai_kanchor_fragment, content, flags=re.IGNORECASE)
+
         # We now rewrite links in a context-aware manner: for each block beginning with
         # <!-- BEGIN_FILE: relative/path.md --> we resolve relative hrefs from that path
         begin_marker_re = re.compile(r'<!--\s*BEGIN_FILE:\s*(.*?)\s*-->')
         link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)')
+        html_link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.html?)(#[^)]+)?\)')
         hashlink_pattern = re.compile(r'\[([^\]]+)\]\(#([^)#\s]+)\)')
 
         # Path normalization to handle URL-encoding and non-breaking spaces in converted content
@@ -959,7 +1010,7 @@ def update_internal_links(concatenated_md_path):
             anchor_positions.append((m.start(), anchor_id))
 
         # Include explicitly injected anchors as well
-        for m in re.finditer(r'<a\s+id=\"([^\"]+)\"\s*>\s*</a>', content):
+        for m in re.finditer(r'<a\s+(?:id|name)=\"([^\"]+)\"[^>]*>\s*</a>', content):
             anchor_positions.append((m.start(), m.group(1)))
 
         # Build lookup by base -> sorted list of (pos, anchor_id)
@@ -996,9 +1047,14 @@ def update_internal_links(concatenated_md_path):
 
             def replace_link_ctx(m):
                 link_text = m.group(1)
-                href = m.group(2)
+                href_md = m.group(2)
+                frag = m.group(3)  # like '#Section'
+                # If an explicit fragment exists, prefer using it as an in-document anchor
+                if frag:
+                    return f'[{link_text}]({frag})'
+
                 # Resolve href relative to the source file's directory
-                href_norm = normalize_path_for_lookup(href)
+                href_norm = normalize_path_for_lookup(href_md)
                 # If already absolute (unlikely in our md), just normalize
                 rel_base = normalize_path_for_lookup(os.path.dirname(source_rel))
                 resolved = os.path.normpath(os.path.join(rel_base, href_norm))
@@ -1012,10 +1068,65 @@ def update_internal_links(concatenated_md_path):
                 if anchor:
                     return f'[{link_text}](#{anchor})'
                 else:
-                    logger.warning(f"No anchor mapping for link to '{href}' (resolved from '{source_rel}' -> '{resolved}'). Leaving link unchanged.")
+                    logger.warning(f"No anchor mapping for link to '{href_md}' (resolved from '{source_rel}' -> '{resolved}'). Leaving link unchanged.")
                     return m.group(0)
 
+            def replace_html_link_ctx(m):
+                link_text = m.group(1)
+                href_html = m.group(2)
+                frag = m.group(3)  # like '#Section'
+
+                # Resolve href relative to the source file's directory
+                href_norm = normalize_path_for_lookup(href_html)
+                rel_base = normalize_path_for_lookup(os.path.dirname(source_rel))
+                resolved_html = os.path.normpath(os.path.join(rel_base, href_norm))
+                resolved_html = normalize_path_for_lookup(resolved_html)
+
+                # Try file-level anchor mapping (map .html -> .md key)
+                resolved_md = re.sub(r'(?i)\.html?$', '.md', resolved_html)
+                file_anchor = anchors_by_rel.get(resolved_md)
+
+                # If we have a fragment, normalize to an actual heading anchor id
+                if frag:
+                    ref = frag[1:]
+                    # Normalize malformed fragments (e.g., a-idkanchor12a...)
+                    def normalize_fragment(r: str) -> str:
+                        s0 = r
+                        changed = False
+                        s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
+                        if s != s0:
+                            changed = True
+                            s0 = s
+                        s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
+                        if s != s0:
+                            changed = True
+                            s0 = s
+                        if changed and s0.startswith('a'):
+                            s0 = s0[1:]
+                        return s0
+                    ref_norm = normalize_fragment(ref)
+                    base = anchor_base(generate_markdown_anchor(ref_norm))
+                    candidates = anchors_by_base.get(base, [])
+                    if candidates:
+                        # Prefer nearest to this block for stability
+                        def dist(t):
+                            return abs(t[0] - block_abs_start)
+                        chosen = min(candidates, key=dist)[1]
+                        return f'[{link_text}](#{chosen})'
+                    # Fallback to file-level anchor if fragment not found
+                    if file_anchor:
+                        return f'[{link_text}](#{file_anchor})'
+                    return m.group(0)
+
+                # No fragment: use file-level anchor if available
+                if file_anchor:
+                    return f'[{link_text}](#{file_anchor})'
+
+                logger.warning(f"No anchor mapping for HTML link to '{href_html}' (resolved '{resolved_html}' -> '{resolved_md}'). Leaving unchanged.")
+                return m.group(0)
+
             block_after_md = link_pattern.sub(replace_link_ctx, block_text)
+            block_after_html = html_link_pattern.sub(replace_html_link_ctx, block_after_md)
 
             # Remap in-document hash links to the correct unique anchor ids present in the doc
             block_abs_start = match.end()
@@ -1024,11 +1135,28 @@ def update_internal_links(concatenated_md_path):
             def replace_hashlink_ctx(m):
                 link_text = m.group(1)
                 ref = m.group(2)
-                # If already a valid anchor id, keep it
-                if ref in available_anchor_ids:
-                    return m.group(0)
+                # Normalize malformed fragments (e.g., a-idkanchor12aadvanced-distribution-modes)
+                def normalize_fragment(r: str) -> str:
+                    s0 = r
+                    changed = False
+                    s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
+                    if s != s0:
+                        changed = True
+                        s0 = s
+                    s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
+                    if s != s0:
+                        changed = True
+                        s0 = s
+                    # Drop leftover leading 'a' only if we previously changed something
+                    if changed and s0.startswith('a'):
+                        s0 = s0[1:]
+                    return s0
+                ref_norm = normalize_fragment(ref)
+                # If already a valid anchor id, rewrite to the normalized id
+                if ref_norm in available_anchor_ids:
+                    return f'[{link_text}](#{ref_norm})'
                 # Normalize to base
-                base = generate_markdown_anchor(ref)
+                base = anchor_base(generate_markdown_anchor(ref_norm))
                 base = anchor_base(base)
                 candidates = anchors_by_base.get(base, [])
                 if not candidates:
@@ -1045,7 +1173,7 @@ def update_internal_links(concatenated_md_path):
                     chosen = min(candidates, key=dist)[1]
                 return f'[{link_text}](#{chosen})'
 
-            block_after_hash = hashlink_pattern.sub(replace_hashlink_ctx, block_after_md)
+            block_after_hash = hashlink_pattern.sub(replace_hashlink_ctx, block_after_html)
             new_parts.append(block_after_hash)
             last_pos = block_end
 
@@ -1061,6 +1189,9 @@ def update_internal_links(concatenated_md_path):
         def global_replace(m):
             link_text = m.group(1)
             href = m.group(2)
+            frag = m.group(3)
+            if frag:
+                return f'[{link_text}]({frag})'
             href_norm = normalize_path_for_lookup(href)
 
             # If we can find an exact rel match, use it
@@ -1094,14 +1225,73 @@ def update_internal_links(concatenated_md_path):
 
         updated_content = re.sub(r'\[([^\]]+)\]\(([^)]+\.md)(#[^)]+)?\)', global_replace, updated_content)
 
+        # Global fallback for .htm/.html links
+        def global_replace_html(m):
+            link_text = m.group(1)
+            href = m.group(2)
+            frag = m.group(3)
+            href_norm = normalize_path_for_lookup(href)
+            # Map to md key
+            candidate = re.sub(r'(?i)\.html?$', '.md', href_norm)
+            candidate = candidate.lstrip('./')
+            while candidate.startswith('../'):
+                candidate = candidate[3:]
+            if not candidate.startswith('Content/'):
+                cand2 = f'Content/{candidate}'
+            else:
+                cand2 = candidate
+            if cand2 in anchors_by_rel and not frag:
+                return f'[{link_text}](#{anchors_by_rel[cand2]})'
+            # If a fragment exists, normalize and resolve via anchors_by_base
+            if frag:
+                ref = frag[1:]
+                def normalize_fragment(r: str) -> str:
+                    s0 = r
+                    changed = False
+                    s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
+                    if s != s0:
+                        changed = True
+                        s0 = s
+                    s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
+                    if s != s0:
+                        changed = True
+                        s0 = s
+                    if changed and s0.startswith('a'):
+                        s0 = s0[1:]
+                    return s0
+                ref_norm = normalize_fragment(ref)
+                base = anchor_base(generate_markdown_anchor(ref_norm))
+                candidates = anchors_by_base.get(base, [])
+                if candidates:
+                    return f'[{link_text}](#{candidates[0][1]})'
+            return m.group(0)
+
+        updated_content = re.sub(r'\[([^\]]+)\]\(([^)]+\.html?)(#[^)]+)?\)', global_replace_html, updated_content)
+
         # Global pass to remap any remaining in-document anchor links to the nearest matching heading id
         # Useful for content that appears before the first BEGIN_FILE marker or edge cases
         def replace_hashlink_global(m):
             link_text = m.group(1)
             ref = m.group(2)
-            if ref in available_anchor_ids:
-                return m.group(0)
-            base = anchor_base(generate_markdown_anchor(ref))
+            # Normalize malformed fragments globally
+            def normalize_fragment(r: str) -> str:
+                s0 = r
+                changed = False
+                s = re.sub(r'^a-id', '', s0, flags=re.IGNORECASE)
+                if s != s0:
+                    changed = True
+                    s0 = s
+                s = re.sub(r'^kanchor\d+', '', s0, flags=re.IGNORECASE)
+                if s != s0:
+                    changed = True
+                    s0 = s
+                if changed and s0.startswith('a'):
+                    s0 = s0[1:]
+                return s0
+            ref_norm = normalize_fragment(ref)
+            if ref_norm in available_anchor_ids:
+                return f'[{link_text}](#{ref_norm})'
+            base = anchor_base(generate_markdown_anchor(ref_norm))
             candidates = anchors_by_base.get(base, [])
             if not candidates:
                 return m.group(0)
@@ -1272,6 +1462,34 @@ def clean_markdown_content(content):
     5. DOES NOT remove BEGIN_FILE comments or anchors in the middle of content
     """
     
+    # Step A: Remove obviously malformed anchors produced by bad placeholder merges
+    content = re.sub(r'^\s*<a\s+id="a-id[^"]*"\s*>\s*</a>\s*\n?', '', content, flags=re.MULTILINE)
+
+    # Step B: For headers that contain inline anchors, hoist a single preferred anchor above the header
+    header_line_re = re.compile(r'^(?P<hashes>#{1,6})\s+(?P<body>.*)$', re.MULTILINE)
+    inline_anchor_re = re.compile(r'<a\s+id="([^"]+)"\s*>\s*</a>', re.IGNORECASE)
+
+    def rewrite_header(m):
+        hashes = m.group('hashes')
+        body = m.group('body')
+        anchors = inline_anchor_re.findall(body)
+        if not anchors:
+            return m.group(0)
+        # Prefer first non-kanchor anchor, else the first
+        preferred = None
+        for a in anchors:
+            if not re.match(r'^kanchor\d+$', a, re.IGNORECASE):
+                preferred = a
+                break
+        if preferred is None:
+            preferred = anchors[0]
+        # Remove all inline anchors from the header text
+        clean_text = inline_anchor_re.sub('', body).strip()
+        # Emit anchor on its own line, then clean header
+        return f'<a id="{preferred}"></a>\n{hashes} {clean_text}'
+
+    content = header_line_re.sub(rewrite_header, content)
+
     # Pattern 1: Remove ONLY the very first BEGIN_FILE comment at the start of the file
     # This is typically at the top and not needed, but keep all others for reference
     first_begin_file = re.compile(r'^<!--\s*BEGIN_FILE:.*?-->\s*\n', re.MULTILINE)

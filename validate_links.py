@@ -50,15 +50,19 @@ def extract_links_from_md(md_file: Path) -> List[str]:
         print(f"{RED}Error reading {md_file}: {e}{RESET}")
         return []
 
-def check_url(url: str, timeout: int = 10) -> Tuple[str, int, str]:
+def check_url(url: str, timeout: int = 10, delay: float = 0.0) -> Tuple[str, int, str]:
     """
     Check if a URL returns 200 OK.
     Returns (url, status_code, error_message)
     """
     try:
+        if delay and delay > 0:
+            time.sleep(delay)
         response = requests.head(url, timeout=timeout, allow_redirects=True)
         # If HEAD doesn't work, try GET
         if response.status_code == 405 or response.status_code == 404:
+            if delay and delay > 0:
+                time.sleep(delay)
             response = requests.get(url, timeout=timeout, allow_redirects=True)
         return (url, response.status_code, "")
     except requests.exceptions.Timeout:
@@ -72,7 +76,7 @@ def check_url(url: str, timeout: int = 10) -> Tuple[str, int, str]:
     except Exception as e:
         return (url, 0, f"Unknown Error: {str(e)}")
 
-def validate_file_links(md_file: Path, num_links: int = 5, max_workers: int = 5, url_filter: str = None, exclude_known_broken: bool = False) -> Dict:
+def validate_file_links(md_file: Path, num_links: int = 5, max_workers: int = 5, url_filter: str = None, exclude_known_broken: bool = False, check_all: bool = False, request_delay: float = 0.0) -> Dict:
     """
     Validate random links from a markdown file.
     Returns a dictionary with validation results.
@@ -104,13 +108,16 @@ def validate_file_links(md_file: Path, num_links: int = 5, max_workers: int = 5,
             'has_errors': False
         }
     
-    # Pick random links (or all if fewer than num_links)
-    sample_size = min(num_links, len(links))
-    sampled_links = random.sample(links, sample_size)
+    # Pick links to check
+    if check_all:
+        sampled_links = links
+    else:
+        sample_size = min(num_links, len(links))
+        sampled_links = random.sample(links, sample_size)
     
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {executor.submit(check_url, url): url for url in sampled_links}
+        future_to_url = {executor.submit(check_url, url, 10, request_delay): url for url in sampled_links}
         
         for future in as_completed(future_to_url):
             url, status_code, error = future.result()
@@ -131,7 +138,7 @@ def validate_file_links(md_file: Path, num_links: int = 5, max_workers: int = 5,
         'has_errors': has_errors
     }
 
-def print_file_results(file_result: Dict):
+def print_file_results(file_result: Dict, log_errors_path: Path = None):
     """Print results for a single file."""
     file_path = file_result['file']
     has_errors = file_result['has_errors']
@@ -157,6 +164,13 @@ def print_file_results(file_result: Dict):
                 print(f"    {RED}✗ [{status}]{RESET} {url}")
             else:
                 print(f"    {RED}✗ [{error}]{RESET} {url}")
+            # Log failing links if requested
+            if log_errors_path is not None:
+                try:
+                    with open(log_errors_path, 'a', encoding='utf-8') as lf:
+                        lf.write(f"{file_path}\t{status if status>0 else error}\t{url}\n")
+                except Exception:
+                    pass
 
 def signal_handler(sig, frame):
     """Handle Ctrl-C gracefully."""
@@ -192,6 +206,12 @@ Examples:
                         help='Only check URLs containing this string (optional)')
     parser.add_argument('--exclude-known-broken', action='store_true',
                         help='Exclude known broken URL patterns (Shared_Admin, ENCODINGS, etc.)')
+    parser.add_argument('--check-all', action='store_true',
+                        help='Check all links in each file (overrides --num-links)')
+    parser.add_argument('--log-errors', default=None,
+                        help='Path to a file to append failing link lines: file\tstatus_or_error\turl')
+    parser.add_argument('--request-delay', type=float, default=0.0,
+                        help='Delay in seconds between requests to avoid throttling (default: 0)')
     
     args = parser.parse_args()
     
@@ -221,6 +241,16 @@ Examples:
     
     start_time = time.time()
     
+    # Prepare error log file if requested
+    log_errors_path = Path(args.log_errors) if args.log_errors else None
+    if log_errors_path is not None:
+        try:
+            # Truncate existing file
+            with open(log_errors_path, 'w', encoding='utf-8') as _:
+                pass
+        except Exception:
+            pass
+
     # Process each file
     all_results = []
     files_with_errors = []
@@ -228,7 +258,7 @@ Examples:
     try:
         for md_file in md_files:
             print(f"\n{BLUE}Processing: {md_file.name}...{RESET}", end='', flush=True)
-            result = validate_file_links(md_file, args.num_links, args.max_workers, args.url_filter, args.exclude_known_broken)
+            result = validate_file_links(md_file, args.num_links, args.max_workers, args.url_filter, args.exclude_known_broken, args.check_all, args.request_delay)
             all_results.append(result)
             
             if result['has_errors']:
@@ -238,7 +268,7 @@ Examples:
             print(f"\r{' ' * 100}\r", end='', flush=True)
             
             # Print results
-            print_file_results(result)
+            print_file_results(result, log_errors_path)
     except KeyboardInterrupt:
         print(f"\n\n{YELLOW}⚠ Interrupted by user during processing{RESET}")
         print(f"{CYAN}Partial results processed: {len(all_results)}/{len(md_files)} files{RESET}")

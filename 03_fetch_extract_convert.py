@@ -94,14 +94,18 @@ def derive_base_and_site(zip_url: str):
     Return:
       base_url: https://www.microfocus.com/documentation/idol/knowledge-discovery-25.4
       site_dir: Content_25.4_Documentation
+    If a local path is provided, base_url is None to disable external header links.
     """
     parsed = urlparse(zip_url)
     path = parsed.path.rstrip("/")
     filename = os.path.basename(path)
     site_dir = re.sub(r"\.zip$", "", filename, flags=re.IGNORECASE)
-    base_path = os.path.dirname(path)
-    base_url = f"{parsed.scheme}://{parsed.netloc}{base_path}"
-    return base_url, site_dir
+    if parsed.scheme in ("http", "https"):
+        base_path = os.path.dirname(path)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{base_path}"
+        return base_url, site_dir
+    # Local file path: disable external header link generation
+    return None, site_dir
 
 
 def ensure_dir(p: Path):
