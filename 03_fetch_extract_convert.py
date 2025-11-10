@@ -357,7 +357,8 @@ def main():
 
     # Step 3: Convert
     print_section(format_bold("CONVERT"))
-    all_md_contents = []  # Collect all markdown contents to merge
+    all_md_contents = []  # Collect aggregated internal markdown
+    all_external_contents = []  # Collect aggregated external-link markdown
     target_assets_dir = output_md_dir / f"{site_dir}_assets"
     
     for base in base_folders:
@@ -391,14 +392,30 @@ def main():
         if not concat_candidates:
             print(f"  ✗ No concatenated MD found")
             continue
+        concatenated_md = None
+        external_md = None
+        for candidate in concat_candidates:
+            name = candidate.stem
+            if name.endswith("__external"):
+                external_md = candidate
+            elif concatenated_md is None:
+                concatenated_md = candidate
+        if concatenated_md is None:
+            concatenated_md = concat_candidates[0]
         
-        concatenated_md = concat_candidates[0]
         with open(concatenated_md, 'r', encoding='utf-8') as f:
             content = f.read()
             # Add a separator between guides
             if all_md_contents:
                 all_md_contents.append(f"\n\n---\n\n# {base_name} Guide\n\n")
             all_md_contents.append(content)
+
+        if external_md and external_md.exists():
+            with open(external_md, 'r', encoding='utf-8') as f:
+                ext_content = f.read()
+                if all_external_contents:
+                    all_external_contents.append(f"\n\n---\n\n# {base_name} Guide\n\n")
+                all_external_contents.append(ext_content)
 
         # Merge assets from all subfolders
         assets_dir = md_dir / f"{site_dir}_assets"
@@ -429,11 +446,20 @@ def main():
         except Exception as e:
             print(f"  ⚠ Anchor dedupe on {final_md_path.name} failed: {e}")
 
+    # Write external-link aggregate if available
+    final_external_path = None
+    if all_external_contents:
+        final_external_path = output_md_dir / f"{site_dir}__external.md"
+        with open(final_external_path, 'w', encoding='utf-8') as f:
+            f.write(''.join(all_external_contents))
+
     # Final output
     print_section(format_bold("OUTPUT"))
     print(f"  Markdown: {format_green(short_path(output_md_dir / f'{site_dir}.md'))}")
     if (output_md_dir / f"{site_dir}_assets").is_dir():
         print(f"  Assets:   {short_path(output_md_dir / f'{site_dir}_assets')}")
+    if final_external_path and final_external_path.exists():
+        print(f"  External: {short_path(final_external_path)}")
     
     total_time = time.time() - start_time
     print_section()

@@ -53,3 +53,11 @@ def test_explicit_html_extension_preserved():
     doc = 'Content_25.4_Documentation'
     expected = f"{base}/{doc}/Help/Content/Foo/Page.html"
     case(base, doc, '../../Content/Foo/Page.html', expected)
+
+
+def test_spaces_in_path_are_percent_encoded():
+    base = 'https://www.microfocus.com/documentation/idol/knowledge-discovery-25.4'
+    doc = 'Content_25.4_Documentation'
+    raw = '../../Part - Store Content/Configure/Stored_Content.htm'
+    expected = f"{base}/{doc}/Help/Content/Part%20-%20Store%20Content/Configure/Stored_Content.htm"
+    case(base, doc, raw, expected)

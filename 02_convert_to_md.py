@@ -169,6 +169,16 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
             adjust_headers(md_dir)
             # Generate concatenated Markdown file
             concatenated_md_path = generate_concatenated_md(base_folder, md_dir, online_base_url=online_base_url, online_site_dir=online_site_dir, subfolder_name=subfolder_name)
+            external_md_path = None
+            if concatenated_md_path and online_base_url and online_site_dir:
+                external_md_path = create_external_version(
+                    concatenated_md_path,
+                    base_folder,
+                    md_dir,
+                    online_base_url,
+                    online_site_dir,
+                    subfolder_name,
+                )
             # Update internal links in the concatenated file
             if concatenated_md_path:
                 update_internal_links(concatenated_md_path)
@@ -180,22 +190,27 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
                 validate_internal_anchors(concatenated_md_path)
                 # Centralize assets into md/assets and rewrite references
                 unify_assets(concatenated_md_path, md_dir, assets_dirname=assets_dirname or "assets")
-                # Final cleanup: remove unwanted elements (navigation, search artifacts, etc.)
-                try:
-                    with open(concatenated_md_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    cleaned_content = clean_markdown_content(content)
-                    
-                    with open(concatenated_md_path, 'w', encoding='utf-8') as f:
-                        f.write(cleaned_content)
-                    
-                    logger.info(f"Cleaned unwanted elements from concatenated file")
-                    if dedupe_global_anchors(concatenated_md_path):
-                        update_internal_links(concatenated_md_path)
-                        validate_internal_anchors(concatenated_md_path)
-                except Exception as clean_error:
-                    logger.warning(f"Error during post-processing cleanup: {clean_error}")
+                if external_md_path and os.path.exists(external_md_path):
+                    unify_assets(external_md_path, md_dir, assets_dirname=assets_dirname or "assets")
+
+                def clean_and_finalize(md_path, refresh_internal_links):
+                    if not md_path or not os.path.exists(md_path):
+                        return
+                    try:
+                        with open(md_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        cleaned_content = clean_markdown_content(content)
+                        with open(md_path, 'w', encoding='utf-8') as f:
+                            f.write(cleaned_content)
+                        logger.info(f"Cleaned unwanted elements from {md_path}")
+                        if refresh_internal_links and dedupe_global_anchors(md_path):
+                            update_internal_links(md_path)
+                            validate_internal_anchors(md_path)
+                    except Exception as clean_error:
+                        logger.warning(f"Error during post-processing cleanup for {md_path}: {clean_error}")
+
+                clean_and_finalize(concatenated_md_path, refresh_internal_links=True)
+                clean_and_finalize(external_md_path, refresh_internal_links=False)
         else:
             logger.warning(f"No TOC files found in {base_folder}")
     finally:
@@ -734,6 +749,36 @@ def detect_source_extension(base_folder: str, rel_path_no_ext: str):
         return '.htm'
     return None
 
+def create_external_version(concatenated_md_path,
+                            base_folder,
+                            md_dir,
+                            online_base_url,
+                            online_site_dir,
+                            subfolder_name):
+    """
+    Create a copy of the concatenated markdown with all cross-reference links rewritten
+    to point directly at the online documentation. Returns the path to the new file.
+    """
+    try:
+        base_name = os.path.basename(concatenated_md_path)
+        stem, ext = os.path.splitext(base_name)
+        external_name = f"{stem}__external{ext}"
+        external_path = os.path.join(md_dir, external_name)
+        shutil.copy2(concatenated_md_path, external_path)
+        fix_cross_references(
+            external_path,
+            online_base_url,
+            online_site_dir,
+            subfolder_name,
+            force_external=True,
+            source_root_override=base_folder,
+        )
+        logger.info(f"External-link markdown created at: {external_path}")
+        return external_path
+    except Exception as e:
+        logger.error(f"Failed to create external version for {concatenated_md_path}: {e}")
+        return None
+
 def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None, subfolder_name=None):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
@@ -906,12 +951,19 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
         logger.error(f"Error generating concatenated Markdown file: {e}\n{traceback.format_exc()}")
         return None
 
-def fix_cross_references(concatenated_md_path, online_base_url=None, online_site_dir=None, subfolder_name=None):
+def fix_cross_references(concatenated_md_path,
+                         online_base_url=None,
+                         online_site_dir=None,
+                         subfolder_name=None,
+                         output_path=None,
+                         force_external=False,
+                         source_root_override=None):
     """
     Fixes cross-reference links to external documents (e.g., ../../Shared_Admin/..., ../../Actions/...).
     Converts them to online documentation URLs, but only if the target is not part of the current bundle.
     """
     try:
+        target_path = output_path or concatenated_md_path
         if not os.path.exists(concatenated_md_path):
             logger.error(f"Concatenated Markdown file {concatenated_md_path} does not exist.")
             return
@@ -919,7 +971,7 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
         skip_external = not (online_base_url and online_site_dir)
         
         md_dir = os.path.dirname(concatenated_md_path)
-        source_root = os.path.normpath(os.path.join(md_dir, os.pardir))
+        source_root = source_root_override or os.path.normpath(os.path.join(md_dir, os.pardir))
         anchors_path = os.path.join(md_dir, '__anchors.json')
         anchors_by_rel = {}
         if os.path.exists(anchors_path):
@@ -933,9 +985,13 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
         with open(concatenated_md_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        cross_ref_pattern = re.compile(r'\[([^\]]+)\]\(((?:\.\./)+[^)]+\.(?:htm|md)(?:#[^)]*)?)\)')
+        cross_ref_pattern = re.compile(
+            r'\[([^\]]+)\]\(((?!https?://|mailto:)[^)\s]+?\.(?:htm|md)(?:#[^)]*)?)\)',
+            re.IGNORECASE
+        )
+        hash_link_pattern = re.compile(r'\[([^\]]+)\]\(#([^)#\s]+)\)')
         
-        begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:\s*([^\s]+)\s*-->')
+        begin_file_pattern = re.compile(r'<!--\s*BEGIN_FILE:\s*(.*?)\s*-->')
         context_map = [(match.start(), match.group(1)) for match in begin_file_pattern.finditer(content)]
         
         def get_context_info(pos):
@@ -954,19 +1010,21 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
         
         def replace_cross_ref(match):
             link_text = match.group(1)
-            rel_path_href = match.group(2)
+            rel_path_href = match.group(2).strip()
             link_position = match.start()
             
             source_file, context_subfolder = get_context_info(link_position)
+            resolved_rel_path = None
             
             if source_file:
                 source_dir = os.path.dirname(source_file)
                 target_path_no_anchor = rel_path_href.split('#')[0]
                 
                 resolved_path = os.path.normpath(os.path.join(source_dir, target_path_no_anchor))
-                resolved_path_md = os.path.splitext(resolved_path.replace('\\', '/'))[0] + '.md'
+                resolved_rel_path = resolved_path.replace('\\', '/')
+                resolved_path_md = os.path.splitext(resolved_rel_path)[0] + '.md'
                 
-                if resolved_path_md in anchors_by_rel:
+                if resolved_path_md in anchors_by_rel and not force_external:
                     # Convert to an internal anchor link using the target file's anchor id
                     anchor_id = anchors_by_rel[resolved_path_md]
                     return f'[{link_text}](#{anchor_id})'
@@ -983,7 +1041,8 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
                 return match.group(0)
 
             fam = detect_doc_family_from_site_dir(online_site_dir)
-            clean_path, anchor2, ext = strip_rel_and_ext(file_path)
+            target_rel_path = resolved_rel_path or file_path
+            clean_path, anchor2, ext = strip_rel_and_ext(target_rel_path)
             
             inferred_sub = infer_subfolder_from_path(clean_path) if fam == 'idolserver' else None
             eff_sub = inferred_sub or (context_subfolder if fam == 'idolserver' else subfolder_name)
@@ -1007,8 +1066,37 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
             return f'[{link_text}]({online_url})'
         
         updated_content = cross_ref_pattern.sub(replace_cross_ref, content)
+
+        def replace_hash_link(match):
+            if not force_external or skip_external:
+                return match.group(0)
+            link_text = match.group(1)
+            fragment = normalize_fragment_value(match.group(2))
+            link_position = match.start()
+            source_file, context_subfolder = get_context_info(link_position)
+            if not source_file:
+                return match.group(0)
+            fam = detect_doc_family_from_site_dir(online_site_dir)
+            rel_md = source_file.replace('\\', '/')
+            rel_no_ext = os.path.splitext(rel_md)[0]
+            eff_sub = infer_subfolder_from_path(source_file) if fam == 'idolserver' else subfolder_name
+            norm_path = normalize_target_path(rel_no_ext, fam, eff_sub)
+            detected_ext = detect_source_extension(source_root, rel_no_ext) or '.htm'
+            norm_with_ext = f"{norm_path}{detected_ext}"
+            anchor = f"#{fragment}" if fragment else ''
+            online_url = build_online_url(
+                online_base_url,
+                online_site_dir,
+                norm_with_ext,
+                anchor,
+                fam,
+                eff_sub,
+            )
+            return f'[{link_text}]({online_url})'
+
+        updated_content = hash_link_pattern.sub(replace_hash_link, updated_content)
         
-        with open(concatenated_md_path, 'w', encoding='utf-8') as f:
+        with open(target_path, 'w', encoding='utf-8') as f:
             f.write(updated_content)
     
     except Exception as e:

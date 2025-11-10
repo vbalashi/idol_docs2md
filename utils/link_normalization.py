@@ -1,5 +1,6 @@
 import os
 import re
+from urllib.parse import quote
 from typing import Optional, Tuple
 
 # Canonical casing for known documentation path segments so that we do not
@@ -61,6 +62,18 @@ def _apply_canonical_segment_case(path: str) -> str:
         lower = segment.lower()
         pieces.append(CANONICAL_SEGMENTS.get(lower, segment))
     return '/'.join(pieces)
+
+def _encode_path(path: str) -> str:
+    """Percent-encode each segment of a path while preserving separators."""
+    if not path:
+        return ''
+    parts = [quote(part, safe='%-._~') for part in path.split('/')]
+    return '/'.join(parts)
+
+def _encode_component(value: str) -> str:
+    if not value:
+        return ''
+    return quote(value, safe='%-._~')
 
 
 def normalize_target_path(path: str, family: str, idol_subfolder: Optional[str] = None) -> str:
@@ -134,18 +147,25 @@ def build_online_url(base_url: str,
     path = path.lstrip('/')
     sub = _normalize_online_subfolder(site_dir, subfolder)
 
+    site_clean = (site_dir or '').strip('/')
+    path_clean = path.lstrip('/')
+    path_encoded = _encode_path(path_clean)
+    site_encoded = _encode_path(site_clean)
+    sub_encoded = _encode_path(sub) if sub else ''
+
     if 'Content/Shared_Admin/' in path:
         license_site = re.sub(r'IDOLServer', 'LicenseServer', site_dir, flags=re.IGNORECASE)
-        target_site = license_site or site_dir
-        return f"{base_url.rstrip('/')}/{target_site.strip('/')}/Help/{path}{anchor}"
+        target_site = _encode_path((license_site or site_dir).strip('/'))
+        return f"{base_url.rstrip('/')}/{target_site}/Help/{path_encoded}{anchor}"
 
     if fam == 'idolserver':
-        sub_idol = sub.split('/')[-1] if sub else ''
-        if sub_idol:
-            return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Guides/html/{sub_idol}/{path}{anchor}"
+        sub_idol = (sub or '').split('/')[-1] if sub else ''
+        sub_idol_encoded = _encode_component(sub_idol)
+        if sub_idol_encoded:
+            return f"{base_url.rstrip('/')}/{site_encoded}/Guides/html/{sub_idol_encoded}/{path_encoded}{anchor}"
         # Fallback without subfolder (should be rare)
-        return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Guides/html/{path}{anchor}"
+        return f"{base_url.rstrip('/')}/{site_encoded}/Guides/html/{path_encoded}{anchor}"
     # standard
     if sub and sub.lower() != 'help':
-        return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/{sub}/{path}{anchor}"
-    return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Help/{path}{anchor}"
+        return f"{base_url.rstrip('/')}/{site_encoded}/{sub_encoded}/{path_encoded}{anchor}"
+    return f"{base_url.rstrip('/')}/{site_encoded}/Help/{path_encoded}{anchor}"
