@@ -2,24 +2,44 @@ import os
 import re
 from typing import Optional, Tuple
 
+# Canonical casing for known documentation path segments so that we do not
+# inadvertently downcase directories like Content or GrammarReference when
+# reconstructing online URLs.
+CANONICAL_SEGMENTS = {
+    'content': 'Content',
+    'actions': 'Actions',
+    'shared_admin': 'Shared_Admin',
+    'grammarreference': 'GrammarReference',
+    'guides': 'Guides',
+    'html': 'html',
+}
+
 
 def detect_doc_family_from_site_dir(site_dir: str) -> str:
     """Return 'idolserver' if site_dir denotes IDOLServer doc, else 'standard'."""
     return 'idolserver' if 'IDOLServer' in (site_dir or '') else 'standard'
 
 
-def strip_rel_and_ext(path: str) -> tuple[str, str]:
+def strip_rel_and_ext(path: str) -> tuple[str, str, str]:
     """
-    Strips ../ prefixes and file extensions from a path, returning the cleaned path and any anchor.
-    Example: ../../Shared_Admin/_ADM_Config.htm#My_Anchor -> ('Shared_Admin/_ADM_Config', '#My_Anchor')
+    Strips ../ prefixes and file extensions from a path, returning the cleaned path,
+    the anchor (if present), and the original file extension (including the dot).
+    Example: ../../Shared_Admin/_ADM_Config.htm#My_Anchor -> ('Shared_Admin/_ADM_Config', '#My_Anchor', '.htm')
+    Missing extensions default to '.htm'; '.md' inputs are normalized to '.htm'
     """
     # Split anchor first
     parts = path.split('#')
     p = parts[0]
     anchor = f'#{parts[1]}' if len(parts) > 1 else ''
-    
-    # Remove extension
-    p = os.path.splitext(p)[0]
+    p, ext = os.path.splitext(p)
+    ext = (ext or '').lower()
+    if not ext:
+        ext = '.htm'
+    elif ext == '.md':
+        ext = '.htm'
+    elif ext not in ('.htm', '.html'):
+        # retain uncommon extensions as-is (already includes dot from splitext)
+        pass
     
     # Normalize path separators for consistent processing
     p = p.replace('\\', '/')
@@ -29,17 +49,31 @@ def strip_rel_and_ext(path: str) -> tuple[str, str]:
     if p.startswith('../'):
         p = re.sub(r'^(\.\./)+', '', p)
     
-    return p, anchor
+    return p, anchor, ext
+
+
+def _apply_canonical_segment_case(path: str) -> str:
+    """Rewrite known path segments to the casing published online."""
+    if not path:
+        return path
+    pieces = []
+    for segment in path.split('/'):
+        lower = segment.lower()
+        pieces.append(CANONICAL_SEGMENTS.get(lower, segment))
+    return '/'.join(pieces)
 
 
 def normalize_target_path(path: str, family: str, idol_subfolder: Optional[str] = None) -> str:
     """Apply ordered normalization rules to a target path (no host/doc shell)."""
+    path = (path or '').replace('\\', '/')
+    path = _apply_canonical_segment_case(path)
+
     # Rule 1: Shared_Admin → ensure under Content/
     if path.startswith('Shared_Admin/'):
         path = f'Content/{path}'
 
     # Rule 2: ENCODINGS reference page variations → ensure Content/Actions/ENCODINGS
-    if 'ENCODINGS/_IDOL_ENCODINGS.htm' in path:
+    if 'ENCODINGS/_IDOL_ENCODINGS' in path:
         if path.startswith('ENCODINGS/'):
             path = f'Content/Actions/{path}'
         elif path.startswith('Actions/ENCODINGS/'):
@@ -115,4 +149,3 @@ def build_online_url(base_url: str,
     if sub and sub.lower() != 'help':
         return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/{sub}/{path}{anchor}"
     return f"{base_url.rstrip('/')}/{site_dir.strip('/')}/Help/{path}{anchor}"
-

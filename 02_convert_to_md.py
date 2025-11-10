@@ -715,6 +715,25 @@ def infer_subfolder_from_path(file_path):
     
     return None
 
+def detect_source_extension(base_folder: str, rel_path_no_ext: str):
+    """
+    Determine whether the original HTML file used .html or .htm by inspecting the source tree.
+    Returns '.html' / '.htm' when a matching file is found, else None.
+    """
+    if not rel_path_no_ext:
+        return None
+    rel_norm = rel_path_no_ext.replace('\\', '/').strip('/')
+    if not rel_norm:
+        return None
+    rel_parts = rel_norm.split('/')
+    html_candidate = os.path.join(base_folder, *rel_parts) + '.html'
+    htm_candidate = os.path.join(base_folder, *rel_parts) + '.htm'
+    if os.path.exists(html_candidate):
+        return '.html'
+    if os.path.exists(htm_candidate):
+        return '.htm'
+    return None
+
 def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_site_dir=None, subfolder_name=None):
     """
     Generates a concatenated Markdown file named __<Base_Dir_Name>.md
@@ -832,7 +851,9 @@ def generate_concatenated_md(base_folder, md_dir, online_base_url=None, online_s
                 if online_base_url and online_site_dir:
                     # Derive normalized path from the md_file (per-file context)
                     fam = detect_doc_family_from_site_dir(online_site_dir)
-                    rel_html_path = md_file.replace('\\', '/').rsplit('.', 1)[0] + '.htm'
+                    rel_no_ext = md_file.replace('\\', '/').rsplit('.', 1)[0]
+                    detected_ext = detect_source_extension(base_folder, rel_no_ext) or '.htm'
+                    rel_html_path = rel_no_ext + detected_ext
                     
                     # If the path is in Shared_Admin, it should be prefixed correctly
                     # to resolve from the root of the documentation content.
@@ -898,6 +919,7 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
         skip_external = not (online_base_url and online_site_dir)
         
         md_dir = os.path.dirname(concatenated_md_path)
+        source_root = os.path.normpath(os.path.join(md_dir, os.pardir))
         anchors_path = os.path.join(md_dir, '__anchors.json')
         anchors_by_rel = {}
         if os.path.exists(anchors_path):
@@ -961,16 +983,22 @@ def fix_cross_references(concatenated_md_path, online_base_url=None, online_site
                 return match.group(0)
 
             fam = detect_doc_family_from_site_dir(online_site_dir)
-            clean_path, anchor2 = strip_rel_and_ext(file_path)
+            clean_path, anchor2, ext = strip_rel_and_ext(file_path)
             
             inferred_sub = infer_subfolder_from_path(clean_path) if fam == 'idolserver' else None
             eff_sub = inferred_sub or (context_subfolder if fam == 'idolserver' else subfolder_name)
             norm_path = normalize_target_path(clean_path, fam, eff_sub)
+            final_ext = ext or '.htm'
+            if final_ext in ('.htm', '.html'):
+                detected_ext = detect_source_extension(source_root, norm_path)
+                if detected_ext:
+                    final_ext = detected_ext
+            norm_path_with_ext = f"{norm_path}{final_ext}"
             
             online_url = build_online_url(
                 online_base_url,
                 online_site_dir,
-                norm_path,
+                norm_path_with_ext,
                 anchor or (f"#{normalize_fragment_value(anchor2[1:])}" if anchor2 else ''),
                 fam,
                 eff_sub,
