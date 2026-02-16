@@ -320,6 +320,17 @@ def hoist_named_anchors(root):
             except Exception:
                 pass
 
+def remove_code_line_numbers(root):
+    """Remove MadCap codeSnippet line number columns so they don't appear in Markdown output."""
+    if root is None:
+        return
+    try:
+        spans = root.find_all('span', class_='codeSnippetLineNumbers')
+        for sp in spans:
+            sp.decompose()
+    except Exception:
+        pass
+
 def sanitize_html(html_content):
     # Define allowed tags and attributes
     allowed_tags = [
@@ -355,6 +366,11 @@ def convert_html_to_md(input_file, base_folder, md_dir):
         # Preserve legacy anchors: hoist <a name>/<a id> out of headings
         try:
             hoist_named_anchors(main_content)
+        except Exception:
+            pass
+
+        try:
+            remove_code_line_numbers(main_content)
         except Exception:
             pass
 
