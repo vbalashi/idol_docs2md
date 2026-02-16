@@ -200,6 +200,9 @@ def process_base_folder(base_folder, image_extensions, max_workers, online_base_
                         with open(md_path, 'r', encoding='utf-8') as f:
                             content = f.read()
                         cleaned_content = clean_markdown_content(content)
+                        # External output is intended for direct reading/editing.
+                        if not refresh_internal_links:
+                            cleaned_content = format_external_output_content(cleaned_content)
                         with open(md_path, 'w', encoding='utf-8') as f:
                             f.write(cleaned_content)
                         logger.info(f"Cleaned unwanted elements from {md_path}")
@@ -1667,6 +1670,74 @@ def generate_markdown_anchor(title):
     anchor = re.sub(r'[\s_]+', '-', anchor)
     return anchor
 
+def unwrap_commented_links(content: str) -> str:
+    """
+    Convert comment-wrapped links into real Markdown links.
+    Examples:
+      <!-- [text](https://example.com) --> -> [text](https://example.com)
+      <!-- https://example.com --> -> [https://example.com](https://example.com)
+      <!-- <a href="https://example.com">text</a> --> -> [text](https://example.com)
+    """
+    if not content:
+        return content
+
+    # Preserve existing markdown link text exactly as authored.
+    content = re.sub(
+        r'<!--\s*(\[[^\]]+\]\((?:https?://|mailto:)[^)]+\))\s*-->',
+        r'\1',
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    # Convert HTML <a> links wrapped in comments to markdown links.
+    content = re.sub(
+        r'<!--\s*<a\s+[^>]*href=["\']((?:https?://|mailto:)[^"\']+)["\'][^>]*>(.*?)</a>\s*-->',
+        lambda m: f'[{m.group(2).strip() or m.group(1)}]({m.group(1)})',
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Convert raw URL comments into explicit markdown links.
+    content = re.sub(
+        r'<!--\s*((?:https?://|mailto:)[^\s>]+)\s*-->',
+        lambda m: f'[{m.group(1)}]({m.group(1)})',
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    return content
+
+def format_external_output_content(content: str) -> str:
+    """
+    Make external markdown friendlier for editors/readers:
+    1) Convert BEGIN_FILE HTML comments to plain text markers.
+    2) Split heading+inline external link into two lines and show full URL link text.
+    """
+    if not content:
+        return content
+
+    # Replace HTML comment markers with plain-text markers.
+    content = re.sub(
+        r'<!--\s*BEGIN_FILE:\s*(.*?)\s*-->',
+        lambda m: f'[[BEGIN_FILE: {m.group(1)}]]',
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    # Split "## Title [↗](https://...)" into:
+    # ## Title
+    # [https://...](https://...)
+    heading_with_arrow = re.compile(
+        r'^(#{1,6})\s+(.+?)\s+\[↗\]\(((?:https?://|mailto:)[^)]+)\)\s*$',
+        re.MULTILINE,
+    )
+    content = heading_with_arrow.sub(
+        lambda m: f'{m.group(1)} {m.group(2)}\n[{m.group(3)}]({m.group(3)})',
+        content,
+    )
+
+    return content
+
 def clean_markdown_content(content):
     """
     Post-processes markdown content to remove unwanted elements:
@@ -1677,6 +1748,9 @@ def clean_markdown_content(content):
     5. DOES NOT remove BEGIN_FILE comments or anchors in the middle of content
     """
     
+    # Step 0: Convert comment-wrapped links to standard markdown links.
+    content = unwrap_commented_links(content)
+
     # Step A: Remove obviously malformed anchors produced by bad placeholder merges
     content = re.sub(r'^\s*<a\s+id="a-id[^"]*"\s*>\s*</a>\s*\n?', '', content, flags=re.MULTILINE)
 
