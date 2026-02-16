@@ -549,7 +549,7 @@ class CatalogSelectorTUI:
             rows = self.projects
             cursor = self.project_idx
         else:
-            stdscr.addstr(3, 2, "Mode: Version selection (press 'b' to go back)")
+            stdscr.addstr(3, 2, "Mode: Version selection (b/Backspace/Left = back)")
             rows = [v["version"] for v in versions]
             cursor = self.version_idx
 
@@ -604,7 +604,7 @@ class CatalogSelectorTUI:
                 self.mode = "version"
         else:
             versions = self._versions_for_current_project()
-            if key == ord("b"):
+            if key in (ord("b"), curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, 8):
                 self.mode = "project"
             elif key == curses.KEY_UP and self.version_idx > 0:
                 self.version_idx -= 1

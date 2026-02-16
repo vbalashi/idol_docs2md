@@ -1,4 +1,5 @@
 import argparse
+import curses
 import importlib.util
 from pathlib import Path
 
@@ -72,3 +73,36 @@ def test_resolve_doc_url_version_as_positional(monkeypatch):
     )
     args = _args(doc_target="26.1", project="knowledge-discovery")
     assert mod.resolve_doc_url(args) == "https://www.microfocus.com/documentation/idol/knowledge-discovery-26.1/"
+
+
+def _catalog_entries():
+    return [
+        {
+            "project": "knowledge-discovery",
+            "project_label": "knowledge-discovery",
+            "version": "26.1",
+            "url": "https://example/knowledge-discovery-26.1/",
+        },
+        {
+            "project": "knowledge-discovery",
+            "project_label": "knowledge-discovery",
+            "version": "25.4",
+            "url": "https://example/knowledge-discovery-25.4/",
+        },
+    ]
+
+
+def test_catalog_selector_backspace_goes_back_to_project_mode():
+    mod = _load_pipeline_module()
+    selector = mod.CatalogSelectorTUI(_catalog_entries(), refresh_callback=lambda: _catalog_entries())
+    selector.mode = "version"
+    selector.handle_input(127)  # Backspace
+    assert selector.mode == "project"
+
+
+def test_catalog_selector_left_arrow_goes_back_to_project_mode():
+    mod = _load_pipeline_module()
+    selector = mod.CatalogSelectorTUI(_catalog_entries(), refresh_callback=lambda: _catalog_entries())
+    selector.mode = "version"
+    selector.handle_input(curses.KEY_LEFT)
+    assert selector.mode == "project"
