@@ -23,6 +23,7 @@ archive/
 
 # Logs
 *.log
+.cache/
 
 # But keep these
 !README.md
