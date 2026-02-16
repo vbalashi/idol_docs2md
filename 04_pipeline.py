@@ -27,13 +27,14 @@ def _ensure_local_venv_python() -> None:
     if not venv_python.exists():
         return
     try:
-        current_python = Path(sys.executable).resolve()
-        target_python = venv_python.resolve()
+        current_prefix = Path(sys.prefix).resolve()
+        expected_prefix = (SCRIPT_DIR / ".venv").resolve()
     except OSError:
         return
-    if current_python == target_python:
+    # If we're already inside this project's venv, do nothing.
+    if current_prefix == expected_prefix:
         return
-    os.execv(str(target_python), [str(target_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 _ensure_local_venv_python()
