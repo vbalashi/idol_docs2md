@@ -7,12 +7,36 @@ Scans documentation site, provides TUI for selection, and processes multiple ite
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _ensure_local_venv_python() -> None:
+    """
+    If a local .venv exists and we're not using it, re-exec this script with
+    .venv/bin/python so users don't need to activate manually.
+    """
+    venv_python = SCRIPT_DIR / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+    try:
+        current_python = Path(sys.executable).resolve()
+        target_python = venv_python.resolve()
+    except OSError:
+        return
+    if current_python == target_python:
+        return
+    os.execv(str(target_python), [str(target_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_ensure_local_venv_python()
 
 import requests
 from bs4 import BeautifulSoup
@@ -332,7 +356,7 @@ class DocSelectorTUI:
         
         # Filter/search line
         if self.mode == "search":
-            filter_line = f"Search: {self.filter_text}_"
+            filter_line = f"Search: {self.filter_text}_ (Backspace/Left: back)"
         elif self.filter_text:
             filter_line = f"Filter: {self.filter_text} (press '/' to modify)"
         else:
@@ -396,9 +420,17 @@ class DocSelectorTUI:
             elif key == 10:  # ENTER
                 self.mode = "normal"
                 self.filter_items()
-            elif key in (curses.KEY_BACKSPACE, 127, 8):
-                self.filter_text = self.filter_text[:-1]
+            elif key == curses.KEY_LEFT:
+                self.mode = "normal"
                 self.filter_items()
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                # Keep normal backspace editing, but when search text is empty treat as "back".
+                if self.filter_text:
+                    self.filter_text = self.filter_text[:-1]
+                    self.filter_items()
+                else:
+                    self.mode = "normal"
+                    self.filter_items()
             elif 32 <= key <= 126:  # Printable characters
                 self.filter_text += chr(key)
                 self.filter_items()

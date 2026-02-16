@@ -106,3 +106,45 @@ def test_catalog_selector_left_arrow_goes_back_to_project_mode():
     selector.mode = "version"
     selector.handle_input(curses.KEY_LEFT)
     assert selector.mode == "project"
+
+
+def _doc_items(mod):
+    return [
+        mod.DocItem("Getting Started Guide", "https://example/one.zip", "Guide"),
+        mod.DocItem("Release Notes", "https://example/two.zip", "Guide"),
+    ]
+
+
+def _make_doc_selector(mod):
+    # DocSelectorTUI.handle_input depends on curses screen size globals.
+    mod.curses.LINES = 40
+    mod.curses.COLS = 120
+    return mod.DocSelectorTUI(_doc_items(mod))
+
+
+def test_doc_selector_search_backspace_with_empty_query_goes_back():
+    mod = _load_pipeline_module()
+    selector = _make_doc_selector(mod)
+    selector.mode = "search"
+    selector.filter_text = ""
+    selector.handle_input(127)
+    assert selector.mode == "normal"
+
+
+def test_doc_selector_search_backspace_with_query_edits_text():
+    mod = _load_pipeline_module()
+    selector = _make_doc_selector(mod)
+    selector.mode = "search"
+    selector.filter_text = "abc"
+    selector.handle_input(127)
+    assert selector.mode == "search"
+    assert selector.filter_text == "ab"
+
+
+def test_doc_selector_search_left_arrow_goes_back():
+    mod = _load_pipeline_module()
+    selector = _make_doc_selector(mod)
+    selector.mode = "search"
+    selector.filter_text = "abc"
+    selector.handle_input(curses.KEY_LEFT)
+    assert selector.mode == "normal"
